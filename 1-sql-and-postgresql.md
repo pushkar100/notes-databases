@@ -924,28 +924,30 @@ SELECT * FROM users;
 ```
 ```SQL
 SELECT * FROM photos;
-id	url					user_id
-1	https://santina.net		3
-2	https://alayna.net		5
-3	https://kailyn.name		3
-4	http://marjolaine.name	1
-5	http://chet.net			5
-6	http://jerrold.org		2
-7	https://meredith.net	4
-8	http://isaias.net		4
-9	http://dayne.com		4
-10	http://colten.net		2
-11	https://adelbert.biz	5
-12	http://kolby.org		1
-13	https://deon.biz		2
-14	https://marina.com		5
-15	http://johnson.info		1
-16	https://linda.info		2
-17	https://tyrique.info	4
-18	http://buddy.info		5
-19	https://elinore.name	2
-20	http://sasha.com		3
+
+-- id	url					user_id
+-- 1	https://santina.net		3
+-- 2	https://alayna.net		5
+-- 3	https://kailyn.name		3
+-- 4	http://marjolaine.name	1
+-- 5	http://chet.net			5
+-- 6	http://jerrold.org		2
+-- 7	https://meredith.net	4
+-- 8	http://isaias.net		4
+-- 9	http://dayne.com		4
+-- 10	http://colten.net		2
+-- 11	https://adelbert.biz	5
+-- 12	http://kolby.org		1
+-- 13	https://deon.biz		2
+-- 14	https://marina.com		5
+-- 15	http://johnson.info		1
+-- 16	https://linda.info		2
+-- 17	https://tyrique.info	4
+-- 18	http://buddy.info		5
+-- 19	https://elinore.name	2
+-- 20	http://sasha.com		3
 ```
+
 ```SQL
 SELECT * FROM comments;
 
