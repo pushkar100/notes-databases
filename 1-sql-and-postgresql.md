@@ -98,6 +98,7 @@
 
 **SQL != PostgreSQL**
 * SQL is a language used to interact with Databases while Postgres is a database system as a whole
+* SQL is based on the **ANSI standard** which means that the core features like UPDATE, INSERT, DELETE, etc are all the same across the various SQL flavours such as MySQL, PostgreSQL, SQL Server, etc.
 * SQL is used with other databases too with slight differences in the way it is defined. However, knowing basic SQL helps you work with most database systems such as Postgres, SQL server, MySQL, and so on
 
 <!-- TOC --><a name="database-structure"></a>
