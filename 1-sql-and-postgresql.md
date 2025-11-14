@@ -144,6 +144,59 @@ DROP DATABASE IF EXISTS database_name;
 
 `\l` or `\list ` command inside the database system i.e `psql` env
 
+## Working with Postgres using PSQL CLI command
+
+To create and use a PostgreSQL database with `psql` (Refer to local postgres installation section for `psql` installation), follow these steps:
+
+1. Connect to **PostgreSQL server** using `psql`:
+
+```bash
+psql -U postgres
+```
+This logs you into the default postgres user shell where you can run SQL commands.
+
+2. Create a new database with the `CREATE DATABASE` command:
+
+```bash
+CREATE DATABASE dbname;
+```
+Replace dbname with your desired database name. This command creates a database by cloning the default template template1.
+
+3. List all databases to confirm creation:
+
+```bash
+\l
+```
+Your new database should appear in the list.
+
+4. Connect to your newly created database to start using it:
+
+```bash
+\c dbname
+```
+After this, you can run SQL queries and create tables inside this database.
+
+**Optional**: Create tables, insert data, etc., using SQL statements:
+
+```SQL
+CREATE TABLE tablename (
+  column1 datatype constraints,
+  column2 datatype constraints,
+  ...
+);
+```
+
+Alternatively, you can create a database from the command line (outside psql) using:
+```bash
+createdb dbname
+```
+Summary:
+- Use `psql -U username` to enter the PostgreSQL shell.
+- Use `CREATE DATABASE dbname;` to create a database.
+- Use `\l` to list databases and `\c dbname` to connect to a database.
+- Use SQL commands inside the database to create tables and manage data.
+- This method assumes you have the necessary privileges to create databases and users in PostgreSQL.​
+
 <!-- TOC --><a name="creating-a-table-with-create-table"></a>
 ## Creating a table with CREATE TABLE
 
