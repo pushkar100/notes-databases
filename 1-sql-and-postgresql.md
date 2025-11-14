@@ -7,6 +7,7 @@
    * [Basic definitions](#basic-definitions)
    * [Database structure](#database-structure)
    * [Creating and deleting a database](#creating-and-deleting-a-database)
+   * [Working with Postgres using PSQL CLI command](#working-with-postgres-using-psql-cli-command)
    * [Creating a table with CREATE TABLE](#creating-a-table-with-create-table)
       + [Keywords](#keywords)
       + [Identifiers](#identifiers)
