@@ -6,6 +6,7 @@
 - [SQL & PostgreSQL notes](#sql-postgresql-notes)
    * [Basic definitions](#basic-definitions)
    * [Database structure](#database-structure)
+   * [Creating and deleting a database](#creating-and-deleting-a-database)
    * [Creating a table with CREATE TABLE](#creating-a-table-with-create-table)
       + [Keywords](#keywords)
       + [Identifiers](#identifiers)
@@ -117,6 +118,8 @@
 **Start a PostgreSQL server after installation**: 
 
 Use the `psql` command on CLI to get into the database system
+
+## Creating and deleting a database
 
 **Create database**: 
 
