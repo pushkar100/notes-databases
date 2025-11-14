@@ -113,6 +113,22 @@
 | Mumbai         | 12442373         | 603.4        |
 | Sydney         | 5312163          | 12367.7      |
 
+
+**Start a PostgreSQL server after installation**: Use the `psql` command on CLI to get into the database system
+
+**Create database**: `CREATE DATABASE database_name;`
+
+**Delete a database**: `DROP DATABASE database_name;`
+
+It is important to note that you cannot drop a database if there are active connections to it. 
+You must ensure no users or applications are connected to the database before attempting to drop it. You can also add IF EXISTS to prevent errors if the database does not exist:
+
+```SQL
+DROP DATABASE IF EXISTS database_name;
+```
+
+**List the databases**: `\l` or `\list ` command inside the database system i.e `psql` env
+
 <!-- TOC --><a name="creating-a-table-with-create-table"></a>
 ## Creating a table with CREATE TABLE
 
