@@ -83,6 +83,7 @@
    * [App vs database validations](#app-vs-database-validations)
    * [Database design ](#database-design)
       + [Database schema design tools](#database-schema-design-tools)
+   * [Understanding the Internals of PostgreSQL](#understanding-the-internals-of-postgresql)
 
 <!-- TOC end -->
 
@@ -2817,4 +2818,404 @@ Practical examples of designing a database for your app
 4. quickdatabasediagrams.com
 5. ondras.zarovi.cz/sql/demo (Very good, open source)
 
+## Understanding the Internals of PostgreSQL
 
+### PostgreSQL Storage Architecture: Data Directory, Databases, and System Catalogs
+
+PostgreSQL does not dump your entire database into one giant file. Instead, it organizes everything into standard folders and files on your computer's hard drive. To keep things fast and conflict-free, PostgreSQL labels these folders and files with numbers called **Object Identifiers (OIDs)** and uses internal lookup tables to keep track of what is what.
+
+#### Finding Where Data Lives on Disk
+
+To find the exact folder where PostgreSQL stores its data on your machine, run the `SHOW` command:
+
+```sql
+-- View the path to the cluster data directory
+SHOW data_directory;
+```
+
+```text
+       data_directory        
+-----------------------------
+ /Library/PostgreSQL/17/data
+```
+
+> [!NOTE]
+> `SHOW` is a handy command used to check any configuration parameter in PostgreSQL (like paths, memory limits, or port numbers).
+
+#### Inside the Data Directory
+
+Opening this folder reveals the core components of your PostgreSQL cluster:
+
+- `base/`: The main folder holding subfolders for every database you create.
+- `global/`: Contains shared, cluster-wide data (like user logins and roles).
+- `pg_wal/`: Write-Ahead Logs (WAL) that track changes before saving them to disk.
+- `postgresql.conf`: The main settings file for PostgreSQL.
+- `pg_hba.conf`: The security file controlling who can connect to your database.
+
+```text
++--------------------------------------------------------------+
+|                     DATA DIRECTORY ROOT                      |
++--------------------------------------------------------------+
+   |
+   +---> base/               <-- Contains all databases
+   |      |
+   |      +---> 22442/       <-- Database folder by OID (e.g., instagram)
+   |      |      |
+   |      |      +---> 22445 <-- File storing "users" table data
+   |      |      +---> 22459 <-- File storing "posts" table data
+   |      |
+   |      +---> 1/           <-- template1 folder
+   |      +---> 13745/       <-- postgres default database folder
+   |
+   +---> global/             <-- Shared tables across all databases
+   +---> pg_wal/             <-- Transaction logs (WAL)
+   +---> postgresql.conf     <-- Settings file
+   +---> pg_hba.conf         <-- Client connection rules
+```
+
+#### Mapping Database Names to Folder Numbers
+
+Inside `base/`, folders are named with numbers (OIDs) rather than plain names like `instagram`. To see which number belongs to which database, query the `pg_database` system table:
+
+```sql
+-- Match database names to their folder numbers (OIDs)
+SELECT 
+    oid, 
+    datname 
+FROM pg_database;
+```
+
+```text
+  oid  |   datname   
+-------+-------------
+     1 | template1
+ 13745 | postgres
+ 22442 | instagram
+ 22450 | validation
+ 22451 | template0
+```
+
+> [!TIP]
+> Notice the column name is spelled **`datname`** (short for "database name"), not `data_name` or `database_name`.
+
+##### What Are the Template Databases?
+- `template1`: A clean "cookie cutter" database. When you run `CREATE DATABASE my_app;`, PostgreSQL copies this folder to create your new database.
+- `template0`: A backup pristine template kept safe in case `template1` is modified.
+- `postgres`: The default playground database created during installation.
+
+#### Mapping Table Names to Physical Files
+
+Inside a database folder (like `base/22442/`), you will see hundreds of numeric files. These files store your tables, indexes, and sequences. 
+
+To find which file belongs to your table, query the `pg_class` catalog:
+
+```sql
+-- Find the filename on disk for specific tables
+SELECT 
+    oid, 
+    relname, 
+    relkind 
+FROM pg_class 
+WHERE relname IN ('users', 'posts');
+```
+
+```text
+  oid  | relname | relkind 
+-------+---------+---------
+ 22445 | users   | r
+ 22459 | posts   | r
+```
+
+- `oid`: The actual filename on your disk (e.g., file `22445` stores `users`).
+- `relname`: The relation name (table or index name).
+- `relkind`: The object type (`r` = regular table, `i` = index, `S` = sequence).
+
+```mermaid
+flowchart TD
+    A["Query: SELECT * FROM users"] --> B["Look up 'users' in pg_class"]
+    B --> C["Found table OID: 22445"]
+    C --> D["Look up database 'instagram' in pg_database"]
+    D --> E["Found database OID: 22442"]
+    E --> F["Open disk file: base/22442/22445"]
+```
+
+#### System Catalog Quick Reference
+
+| System Catalog | What It Tracks | Key Columns |
+| :--- | :--- | :--- |
+| `pg_database` | Databases in your cluster | `oid` (folder name), `datname` (database name) |
+| `pg_class` | Tables, indexes, and sequences | `oid` (file name), `relname` (table name), `relkind` (type) |
+
+> [!CAUTION]
+> Never manually delete, rename, or edit files in your Postgres data folder through your operating system file browser. Doing so will corrupt your database catalog and break your data!
+
+#### Knowledge Check
+
+<details>
+<summary><b>Question 1: What command shows the folder path where PostgreSQL saves its data?</b></summary>
+<br>
+<b>Answer:</b> <code>SHOW data_directory;</code> displays the full folder path on your computer.
+</details>
+
+<details>
+<summary><b>Question 2: Why does Postgres name database folders with numbers instead of plain text names?</b></summary>
+<br>
+<b>Answer:</b> It uses unique Object Identifiers (OIDs) to avoid operating system filename conflicts, spaces, or special characters.
+</details>
+
+<details>
+<summary><b>Question 3: How do you find which physical file corresponds to the "users" table?</b></summary>
+<br>
+<b>Answer:</b> Query <code>pg_class</code> with <code>SELECT oid, relname FROM pg_class WHERE relname = 'users';</code>. The <code>oid</code> matches the filename on disk.
+</details>
+
+<details>
+<summary><b>Question 4: What is the purpose of template1?</b></summary>
+<br>
+<b>Answer:</b> It serves as the base template. When you run <code>CREATE DATABASE</code>, PostgreSQL copies the <code>template1</code> folder to build your new database.
+</details>
+
+---
+
+### Heaps, Blocks, and Tuples: The Core Storage Hierarchy
+
+Once PostgreSQL finds the table file on disk (like `22445` for `users`), how does it organize rows inside that file? It breaks the file down into a simple, 3-level hierarchy:
+
+1. **Heap File**: The entire file on disk for a single table.
+2. **Blocks (or Pages)**: 8 KB slices that make up the heap file.
+3. **Tuples (or Items)**: The individual rows stored inside a block.
+
+#### Jargon Demystified
+
+PostgreSQL internals use specific terms that mean everyday database concepts:
+
+| Postgres Term | Everyday Term | What It Actually Means |
+| :--- | :--- | :--- |
+| **Heap / Heap File** | Table File | The physical file holding an unordered collection of rows. |
+| **Block / Page** | 8 KB Storage Chunk | The fixed-size unit of data Postgres reads into memory at one time. |
+| **Tuple / Item** | Row / Record | A single data row with its column values. |
+
+> [!NOTE]
+> **Heaps in Postgres vs. Computer Science:** In CS class, a "heap" is a special binary tree used for priority queues. In databases, a "heap file" just means an **unordered pile of records**—PostgreSQL places new rows wherever there is open room.
+
+```text
++-------------------------------------------------------------------------+
+|                  HEAP FILE (e.g., file 22445 for users)                 |
+|                                                                         |
+|  +---------------------+ +---------------------+ +--------------------+ |
+|  |       BLOCK 0       | |       BLOCK 1       | |      BLOCK 2       | |
+|  |     (8 KB Page)     | |     (8 KB Page)     | |    (8 KB Page)     | |
+|  | +-----------------+ | | +-----------------+ | | +----------------+ | |
+|  | | Row 1 (Tuple 1) | | | | Row 3 (Tuple 1) | | | | Row 5 (Tuple 1)| | |
+|  | +-----------------+ | | +-----------------+ | | +----------------+ | |
+|  | | Row 2 (Tuple 2) | | | | Row 4 (Tuple 2) | | | |  [Free Space]  | | |
+|  | +-----------------+ | | +-----------------+ | | +----------------+ | |
+|  +---------------------+ +---------------------+ +--------------------+ |
++-------------------------------------------------------------------------+
+```
+
+#### The Fixed 8 KB Rule
+
+By default, every block in PostgreSQL is exactly **8 kilobytes (8,192 bytes)** in size.
+
+It does not matter whether a block contains 0 rows, 1 large row, or 80 small rows—the block is always allocated as an 8 KB slot on disk.
+
+```mermaid
+flowchart TD
+    subgraph Heap["Heap File (users table on disk)"]
+        direction TB
+        B0["Block 0 (8 KB)"]
+        B1["Block 1 (8 KB)"]
+        B2["Block 2 (8 KB)"]
+    end
+
+    subgraph InsideBlock["Inside Block 1 (8,192 Bytes)"]
+        direction TB
+        T1["Tuple (User: Alex)"]
+        T2["Tuple (User: Sam)"]
+        FS["Remaining Free Space"]
+    end
+
+    B1 --> InsideBlock
+```
+
+#### Why Fixed 8 KB Blocks?
+
+Why doesn't PostgreSQL just stream rows one after another without blocks?
+
+1. **Matching Operating System Hardware:** Hard drives and operating systems read data in fixed page sizes (typically 4 KB or 8 KB). Using 8 KB blocks keeps disk reads fast and aligned.
+2. **Predictable Memory Caching:** PostgreSQL caches tables in RAM (`shared_buffers`). Because all blocks are the same 8 KB size, PostgreSQL can easily swap pages in and out of memory without memory fragmentation.
+3. **Targeted Reading:** When looking up one user, PostgreSQL only loads the single 8 KB block containing that user into RAM, rather than reading a 10 GB file.
+
+#### Seeing Physical Locations with the Hidden `ctid` Column
+
+Every table has a hidden system column called `ctid` that tells you the exact physical block and row position of each record:
+
+```sql
+-- View the physical block and row position of your records
+SELECT 
+    ctid, 
+    id, 
+    username 
+FROM users 
+LIMIT 5;
+```
+
+```text
+ ctid  | id  | username  
+-------+-----+-----------
+ (0,1) |   1 | alexandra
+ (0,2) |   2 | bernard
+ (0,3) |   3 | claudia
+ (1,1) |   4 | dimitri
+ (1,2) |   5 | elena
+```
+
+- In `(0, 1)`: The `0` is the **block number** (starting from 0). The `1` is the **row number** (tuple index) inside that block.
+- In `(1, 1)`: This row is the first tuple inside **Block 1**.
+
+> [!WARNING]
+> Never use `ctid` as an ID in your application code! When you update a row in Postgres, it creates a new version of the row and places it in a new location, changing its `ctid`.
+
+#### Knowledge Check
+
+<details>
+<summary><b>Question 1: What does "heap file" mean in PostgreSQL?</b></summary>
+<br>
+<b>Answer:</b> A heap file is the physical file for an unsorted table where rows can be stored in any block that has available space.
+</details>
+
+<details>
+<summary><b>Question 2: What is the default size of a PostgreSQL block (page)?</b></summary>
+<br>
+<b>Answer:</b> Exactly 8 kilobytes (8,192 bytes).
+</details>
+
+<details>
+<summary><b>Question 3: Are "Tuple" and "Item" different from a table row?</b></summary>
+<br>
+<b>Answer:</b> No. Tuple, Item, and Row are synonyms in PostgreSQL.
+</details>
+
+<details>
+<summary><b>Question 4: What does ctid = (2, 5) tell you about a row?</b></summary>
+<br>
+<b>Answer:</b> The row is physically stored in Block 2 at tuple position 5.
+</details>
+
+---
+
+### Block Data Layout: Physical Anatomy of an 8 KB Page
+
+If you opened an 8 KB block and inspected its raw binary bytes, how is it organized? PostgreSQL uses a clever **two-ended growth** design so that variable-length rows fit snugly without wasting space.
+
+#### The 4 Regions Inside an 8 KB Block
+
+```text
++-------------------------------------------------------------------------+
+|                              PAGE HEADER                                |
+|  - 24 bytes fixed size at the top                                       |
+|  - Tracks page info and pointers to free space (pd_lower, pd_upper)     |
++-------------------------------------------------------------------------+
+|                             LINE POINTERS                               |
+|  - Small 4-byte arrows (ItemIdData)                                     |
+|  - Point to where each row begins and its length                        |
+|  - GROWS DOWNWARD --->                                                  |
++ - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - +
+|                                                                         |
+|                           UNALLOCATED FREE SPACE                        |
+|                     (Empty space ready for new rows)                    |
+|                                                                         |
++ - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - +
+|                               TUPLE DATA                                |
+|  - The actual row contents (headers, text, numbers)                     |
+|  - Stored starting at the very bottom of the page                       |
+|  - <--- GROWS UPWARD                                                    |
++-------------------------------------------------------------------------+
+```
+
+1. **Page Header (Top):**
+   - 24 bytes at the start of the block.
+   - Stores page health information, transaction tracking (LSN), and two pointers:
+     - `pd_lower`: Points to the end of the line pointers (start of free space).
+     - `pd_upper`: Points to the start of the newest row data (end of free space).
+2. **Line Pointers (Item IDs):**
+   - An array of tiny 4-byte pointers right after the header.
+   - Each pointer simply says: *"Tuple #1 starts at byte offset 8,100 and is 92 bytes long."*
+   - They contain no user data—just directions to where the row lives.
+   - **Grows downward** into free space.
+3. **Free Space (Middle):**
+   - The empty cushion in the middle of the block. It shrinks as you add new rows or pointers.
+4. **Tuple Data (Bottom):**
+   - The actual row data (user IDs, usernames, text) plus row headers (`t_xmin`, `t_xmax`).
+   - Starts at the bottom (offset 8,192) and **grows upward** into free space.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant App as "New INSERT"
+    participant Header as "Page Header"
+    participant LinePtr as "Line Pointer (Grows Down)"
+    participant FreeSpace as "Free Space (Middle)"
+    participant TupleData as "Tuple Data (Grows Up)"
+
+    App->>FreeSpace: "Is there enough room for row + 4-byte pointer?"
+    FreeSpace-->>App: "Yes, room available"
+    App->>TupleData: "Write row data at bottom of page (grows upward)"
+    App->>LinePtr: "Add 4-byte pointer at top of page (grows downward)"
+    App->>Header: "Update pd_lower and pd_upper pointers"
+```
+
+#### Why Use Two-Ended Growth?
+
+Why didn't PostgreSQL put pointers and rows next to each other in one direction?
+
+##### 1. No Wasted Space for Variable-Length Data
+In databases, one row might have a short name (3 bytes) and another a long paragraph (500 bytes). With pointers growing from the top and row bytes growing from the bottom, PostgreSQL never has to guess slot sizes in advance. All free space stays in one single chunk in the middle until `pd_lower` meets `pd_upper`.
+
+##### 2. Indexes Never Break When Rows Move
+Indexes (like B-trees) point to `ctid` coordinates—which point to the **Line Pointer index** at the top of the block, not the raw byte position at the bottom.
+- When PostgreSQL vacuums deleted rows or compacts data, the physical row might shift bytes inside the block.
+- PostgreSQL simply updates the 4-byte line pointer offset at the top.
+- Because the line pointer number never changed, **every index pointing to that row stays 100% valid**, saving massive reindexing work!
+
+#### Page Layout Summary
+
+| Region | Where It Sits | Size | Growth Direction | What It Holds |
+| :--- | :--- | :--- | :--- | :--- |
+| **Page Header** | Very top | 24 bytes | Fixed | Metadata, WAL numbers, `pd_lower`, `pd_upper` |
+| **Line Pointers** | Below header | 4 bytes per row | Grows **downward** | Byte offset and length of each row |
+| **Free Space** | Middle | Variable | Shrinks from both ends | Empty bytes ready for future inserts |
+| **Tuple Data** | Very bottom | Variable per row | Grows **upward** | Actual column values and row headers |
+
+> [!TIP]
+> You can check how many bytes any individual column value occupies using the `pg_column_size()` function:
+> ```sql
+> SELECT username, pg_column_size(username) AS byte_size FROM users LIMIT 3;
+> ```
+
+#### Knowledge Check
+
+<details>
+<summary><b>Question 1: In which direction do Line Pointers grow in a PostgreSQL block?</b></summary>
+<br>
+<b>Answer:</b> Line pointers grow downward from the top of the page into the middle free space.
+</details>
+
+<details>
+<summary><b>Question 2: In which direction does the actual row (tuple) data grow?</b></summary>
+<br>
+<b>Answer:</b> Tuple data is placed at the bottom of the page and grows upward into the middle free space.
+</details>
+
+<details>
+<summary><b>Question 3: Does a Line Pointer store the actual column values like usernames or email addresses?</b></summary>
+<br>
+<b>Answer:</b> No. A Line Pointer is only 4 bytes and stores the byte offset and length telling PostgreSQL where the row starts inside the block.
+</details>
+
+<details>
+<summary><b>Question 4: Why do indexes point to line pointer numbers instead of raw byte offsets?</b></summary>
+<br>
+<b>Answer:</b> So that rows can be shifted or compacted during maintenance (like VACUUM) without breaking index pointers. Only the internal line pointer offset needs to be updated.
+</details>
