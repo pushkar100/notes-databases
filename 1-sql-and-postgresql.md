@@ -94,7 +94,8 @@
       + [PostgreSQL Index Types: B-Tree and Specialized Variants](#postgresql-index-types-b-tree-and-specialized-variants)
       + [Automatically Generated Indexes: Primary Keys and Unique Constraints](#automatically-generated-indexes-primary-keys-and-unique-constraints)
       + [Deep Dive: Physical Storage and Anatomy of B-Tree Indexes with Pageinspect](#deep-dive-physical-storage-and-anatomy-of-b-tree-indexes-with-pageinspect)
-   * [The Query Processing Pipeline](#the-query-processing-pipeline)
+   * [Query Tuning Basics](#query-tuning-basics)
+   * [Advanced Query Tuning](#advanced-query-tuning)
 
 
 <!-- TOC end -->
@@ -4255,7 +4256,7 @@ When a table grows to hundreds of thousands or millions of records (such as a `l
 </details>
 
 
-## Query Processing Pipeline, EXPLAIN Plans, and Execution Statistics
+## Query Tuning Basics
 
 ### The Query Processing Pipeline
 
@@ -4768,4 +4769,567 @@ ROLLBACK;</code></pre>
 <summary><b>Question 5: How does PostgreSQL accurately estimate row count and byte width in an EXPLAIN command without reading table data?</b></summary>
 <br>
 <b>Answer:</b> It consults the <b><code>pg_stats</code></b> system catalog view. PostgreSQL maintains precomputed statistics (such as <code>avg_width</code>, <code>n_distinct</code>, and <code>most_common_freqs</code>) that allow the Planner to estimate tuple sizes and cardinalities prior to physical execution.
+</details>
+
+
+## Advanced Query Tuning
+
+### Query Planner Mental Model: Sequential Scan vs. Index Scan
+
+When a SQL query is submitted to PostgreSQL, it does not immediately execute. Instead, it passes through an internal query pipeline: parsing, rewriting, planning, and execution. The most critical component of this pipeline is the **Query Planner** (or Query Optimizer).
+
+The planner's primary responsibility is to evaluate alternative execution strategies and choose the most efficient path—called a **Query Plan**—without actually running the query.
+
+```text
++-----------------------------------------------------------------------+
+|                       POSTGRESQL QUERY PIPELINE                       |
++-----------------------------------------------------------------------+
+                                    |
+                                    v
+                             +-------------+
+                             |  SQL Query  |
+                             +-------------+
+                                    |
+                                    v
+                             +-------------+
+                             |   Parser    |
+                             +-------------+
+                                    |
+                                    v
+                             +-------------+
+                             |  Rewriter   |
+                             +-------------+
+                                    |
+                                    v
+                       +-------------------------+
+                       |     Query Planner       |
+                       |  (Generates candidate   |
+                       |   plans & scores cost)  |
+                       +-------------------------+
+                                    |
+                                    v
+                       +-------------------------+
+                       |    Executor Engine      |
+                       |  (Runs winning plan)    |
+                       +-------------------------+
+```
+
+#### What Is Query "Cost"?
+
+In query optimization, **cost** is not measured in seconds, milliseconds, or CPU cycles. Instead, cost is an **arbitrary, unitless numerical score** calculated by PostgreSQL to estimate the total processing effort and disk I/O required to execute a specific plan or node.
+
+Because physical execution time depends heavily on concurrent server load, hardware speed, and operating system caching, runtime cannot be predicted deterministically. Cost provides an internal metric allowing PostgreSQL to rank candidate plans relative to each other.
+
+#### Evaluating Candidate Plans: Index Scan vs. Sequential Scan
+
+Consider a query searching for a specific user:
+
+```sql
+SELECT * FROM users WHERE username = 'Alison';
+```
+
+The planner identifies two primary execution candidates:
+
+1. **Candidate Plan A (Index Scan):**
+   - Access the B-Tree index on `username`.
+   - Read the index root node, follow child pointers to the appropriate leaf node containing `'Alison'`.
+   - Extract the physical heap pointer (`Block Number`, `Offset/Index`).
+   - Open the table heap file, jump directly to that specific block, and load the record.
+   - _Total disk I/O:_ Fetching approximately 2 random pages (1 index leaf page + 1 heap data block).
+
+2. **Candidate Plan B (Sequential Scan):**
+   - Open the table heap file directly.
+   - Read the file block by block, starting at Block 0 through the end of the file.
+   - For every block, inspect every tuple to check if `username = 'Alison'`.
+   - _Total disk I/O:_ Reading every single block in the table heap file sequentially. If the table has 110 pages, it reads 110 pages.
+
+```text
++-----------------------------------------------------------------------------+
+|                     SEQUENTIAL SCAN VS. RANDOM ACCESS I/O                   |
++-----------------------------------------------------------------------------+
+
+Plan A: Random Index Lookup (Jump to target block)
+Disk Blocks:  [ Block 0 ]   [ Block 1 ]   [ Block 2 ] ... [ Block 109 ]
+                                 ^
+                                 |  (Direct seek to Block 1, Item 2)
+                            [Leaf Node]
+
+Plan B: Sequential Scan (Continuous reading from start to finish)
+Disk Blocks:  [ Block 0 ] -> [ Block 1 ] -> [ Block 2 ] -> ... -> [ Block 109 ]
+              =========> sequential streaming read (low per-page cost) =======>
+```
+
+#### The Physics of Disk I/O: Sequential vs. Random Access
+
+At first glance, reading 2 pages versus 110 pages makes the index scan appear 55 times cheaper. However, disk access physics introduces a crucial nuance:
+
+- **Sequential Access:** Reading consecutive disk blocks allows storage controllers and operating systems to stream data efficiently and use read-ahead caching.
+- **Random Access:** Jumping between non-contiguous blocks on disk requires seek time and separate I/O operations, incurring a performance penalty.
+
+To model this real-world hardware behavior, PostgreSQL assumes that loading a page at random is significantly more expensive than loading pages sequentially. By default, PostgreSQL assigns a baseline score of `1.0` to sequential page reads and a penalty factor of `4.0` to random page reads.
+
+```mermaid
+flowchart TD
+    Q["Query: SELECT * FROM users WHERE username = 'Alison'"] --> P["Query Planner Evaluates Strategies"]
+
+    P --> PlanA["Plan A: Index Scan"]
+    P --> PlanB["Plan B: Sequential Scan"]
+
+    PlanA --> IO_A["Load 2 Random Pages<br/>Cost = 2 pages * 4.0 = 8.0"]
+    PlanB --> IO_B["Load 110 Sequential Pages<br/>Cost = 110 pages * 1.0 = 110.0"]
+
+    IO_A --> Comp{"Compare Scores"}
+    IO_B --> Comp
+
+    Comp -->|"8.0 < 110.0 (Factor of ~13.75x Cheaper)"| Win["Winner: Execute Index Scan"]
+```
+
+Applying these cost factors:
+
+- **Index Scan Score:** $2 \text{ random pages} \times 4.0 = 8.0$
+- **Sequential Scan Score:** $110 \text{ sequential pages} \times 1.0 = 110.0$
+
+Even with the $4\times$ random access penalty, the index scan score of $8.0$ is dramatically lower than $110.0$ (roughly $13.75\times$ cheaper). Therefore, the planner selects the index scan.
+
+### Calculating Query Cost by Hand: Deconstructing the Math
+
+To understand how PostgreSQL generates the numbers displayed in `EXPLAIN` output, we can calculate the exact cost of an individual execution node by hand.
+
+Consider an isolated sequential scan on a `comments` table:
+
+```sql
+-- Retrieve the execution plan for reading all comments
+EXPLAIN SELECT * FROM comments;
+```
+
+#### Table Metrics
+
+From PostgreSQL table metadata, we extract the physical dimensions of the `comments` table:
+
+- **Total Rows (`reltuples`):** $60,410$ rows
+- **Total Disk Pages (`relpages`):** $985$ blocks ($8\text{ KB}$ each)
+
+#### Breaking Down the Workload
+
+Executing a sequential scan involves two distinct types of resource consumption:
+
+1. **Disk I/O Effort:** Fetching all 985 blocks from storage into shared memory buffers sequentially.
+2. **CPU Processing Effort:** Inspecting each of the 60,410 rows in memory, parsing row headers, and validating column attributes.
+
+Processing a row in memory is purely CPU-bound and is significantly cheaper than fetching a physical disk block. PostgreSQL estimates that processing one row consumes approximately $1\%$ ($0.01$) of the effort required to read a single sequential page off disk. In other words, inspecting $100$ rows in memory equals the cost of reading $1$ disk page sequentially.
+
+#### The Cost Calculation
+
+Using sequential page reads as the baseline unit ($1.0$):
+
+$$\text{Total Cost} = (\text{Pages Read Sequentially} \times 1.0) + (\text{Rows Processed} \times 0.01)$$
+
+Substituting the table metrics:
+
+$$\text{Disk Cost} = 985 \times 1.0 = 985.0$$
+$$\text{CPU Cost} = 60,410 \times 0.01 = 604.10$$
+$$\text{Total Cost} = 985.0 + 604.10 = 1589.10$$
+
+#### Verification with PostgreSQL EXPLAIN
+
+Running `EXPLAIN` against the database confirms this exact mathematical result:
+
+```sql
+EXPLAIN SELECT * FROM comments;
+```
+
+Expected output:
+
+```text
+                         QUERY PLAN
+------------------------------------------------------------
+ Seq Scan on comments  (cost=0.00..1589.10 rows=60410 width=84)
+```
+
+The computed value of $1589.10$ matches PostgreSQL's estimated total cost to the decimal point.
+
+> [!NOTE]
+> The cost value $1589.10$ has no physical unit. It simply communicates that reading the entire `comments` table is roughly $1589$ times more computationally expensive than reading a single $8\text{ KB}$ page sequentially from disk.
+
+### PostgreSQL Planner Cost Constants and Formulas
+
+PostgreSQL does not hardcode cost estimates with magic numbers. All cost derivations stem from configurable planner cost constants defined in the server configuration.
+
+#### The Core Cost Constants
+
+| Parameter              | Default Value | Description                                                                       |
+| :--------------------- | :------------ | :-------------------------------------------------------------------------------- |
+| `seq_page_cost`        | `1.0`         | Baseline unit: estimated cost of a sequential disk page fetch.                    |
+| `random_page_cost`     | `4.0`         | Cost of fetching a disk page non-sequentially (random seek).                      |
+| `cpu_tuple_cost`       | `0.01`        | CPU effort required to process each row (tuple) in memory.                        |
+| `cpu_index_tuple_cost` | `0.005`       | CPU effort required to process an index entry during an index scan.               |
+| `cpu_operator_cost`    | `0.0025`      | CPU effort to evaluate an operator or function (e.g., `WHERE`, `JOIN` condition). |
+| `parallel_setup_cost`  | `1000.0`      | Fixed cost of launching parallel worker processes.                                |
+| `parallel_tuple_cost`  | `0.1`         | Cost of transferring a tuple from a parallel worker to the leader process.        |
+
+All constants are calibrated relative to `seq_page_cost = 1.0`. For instance:
+
+- `random_page_cost = 4.0` means random I/O is modeled as $4\times$ more expensive than sequential I/O.
+- `cpu_tuple_cost = 0.01` means processing a row in CPU is $100\times$ cheaper than reading a page from disk.
+- `cpu_index_tuple_cost = 0.005` means evaluating an index entry is half the cost of processing a table tuple ($0.005$ vs $0.01$).
+- `cpu_operator_cost = 0.0025` means evaluating a standard comparison operator (such as `<`, `=`, `+`) is half the cost of an index entry check.
+
+#### The Comprehensive Cost Formula
+
+For any query execution node, the complete cost equation balances sequential I/O, random I/O, CPU tuple overhead, index traversal, and operator evaluations:
+
+```text
++----------------------------------------------------------------------------------------------------+
+|                                  THE COMPREHENSIVE COST FORMULA                                    |
++----------------------------------------------------------------------------------------------------+
+|                                                                                                    |
+|    Total Cost =  ( pages_read_sequentially  *  seq_page_cost [1.0] )                               |
+|                + ( pages_read_at_random     *  random_page_cost [4.0] )                            |
+|                + ( rows_scanned             *  cpu_tuple_cost [0.01] )                             |
+|                + ( index_entries_scanned    *  cpu_index_tuple_cost [0.005] )                      |
+|                + ( operators_evaluated      *  cpu_operator_cost [0.0025] )                        |
+|                                                                                                    |
++----------------------------------------------------------------------------------------------------+
+```
+
+Plain text formulation:
+
+```text
+Total Cost = (pages_seq * seq_page_cost) + (pages_rnd * random_page_cost) + (rows * cpu_tuple_cost) + (index_rows * cpu_index_tuple_cost) + (operators * cpu_operator_cost)
+```
+
+Where:
+
+- `pages_seq`: Number of disk blocks fetched sequentially.
+- `pages_rnd`: Number of disk blocks fetched at random (seek operations).
+- `rows`: Number of table rows (tuples) inspected in memory.
+- `index_rows`: Number of index leaf entries inspected during an index scan.
+- `operators`: Number of filter operators, joins, or functions evaluated in the `WHERE` clause.
+
+#### Why Documentation Often Shows an Abbreviated Formula
+
+In many documentation articles and tutorials, the formula is condensed to:
+
+```text
+Total Cost = (pages * 1.0) + (rows * 0.01)
+```
+
+This simplification applies specifically to simple sequential scans without complex `WHERE` clause filters:
+
+- No random pages are accessed (`pages_rnd = 0`).
+- No index entries are touched (`index_rows = 0`).
+- No custom operators are evaluated (`operators = 0`).
+
+When these zero terms drop out, only sequential disk I/O and CPU tuple processing remain.
+
+> [!TIP]
+> **Hardware Tuning for Modern NVMe SSDs:**
+> The default `random_page_cost = 4.0` was established when spinning mechanical hard drives (HDDs) dominated database servers. Mechanical drives suffer high seek latencies because read/write heads must physically reposition across spinning platters.
+>
+> On modern Solid State Drives (SSDs) and NVMe storage, random access latencies are nearly identical to sequential throughput. In production environments utilizing enterprise SSDs, database administrators frequently reduce `random_page_cost` to `1.1`–`1.5` (or even `1.0` if using battery-backed shared RAM caches). This encourages PostgreSQL to prefer index scans over sequential table scans when selective lookups are executed.
+
+### Startup Cost vs. Total Cost: Streaming vs. Batching
+
+In PostgreSQL `EXPLAIN` output, cost is always represented as a pair of floating-point numbers separated by two dots:
+
+```text
+(cost=startup_cost..total_cost rows=N width=W)
+```
+
+These two numbers do not represent a confidence interval or a range of possible values. Each number has a distinct engineering meaning:
+
+- **Startup Cost (First Number):** The estimated computational effort required for a node to initialize, fetch its dependencies, and output its **very first row**.
+- **Total Cost (Second Number):** The estimated cumulative computational effort required for the node to process and output **all rows** expected by the query.
+
+```text
++-----------------------------------------------------------------------------+
+|                     STARTUP COST VS. TOTAL COST DYNAMICS                    |
++-----------------------------------------------------------------------------+
+
+1. STREAMING / PIPELINED NODE (e.g., Sequential Scan)
+   Time/Cost: 0.00 ............................................... 1589.10
+              ^                                                         ^
+              |-- Emits Row 1 immediately                               |-- Finishes all rows
+              (Startup Cost = 0.00)                                     (Total Cost = 1589.10)
+
+2. BATCH / STOP-AND-WAIT NODE (e.g., Hash Materialization)
+   Time/Cost: 0.00 ----------------------------------------> 8.30
+                                                              ^
+                                                              |-- Hash table fully built;
+                                                                  Emits Row 1 & finishes!
+                                                                  (Startup Cost = Total Cost = 8.30)
+```
+
+#### Streaming Nodes vs. Batching Nodes
+
+The gap between startup cost and total cost reveals how an execution node processes data:
+
+##### Streaming (Pipelined) Nodes
+
+Nodes such as `Seq Scan` and `Index Scan` can begin streaming rows immediately to their parent nodes:
+
+- When a sequential scan opens the first $8\text{ KB}$ block of a table, it processes the very first row and immediately passes it up the execution tree to the consumer.
+- PostgreSQL assigns sequential scans a startup cost of `0.00`. While opening the file and reading the first page technically requires some work, PostgreSQL treats the initial pipeline startup overhead as zero because row streaming begins without pre-aggregating or sorting data.
+- The node continues yielding records row-by-row while upstream nodes process them concurrently.
+
+##### Batching (Stop-and-Wait) Nodes
+
+Nodes such as `Hash`, `Sort`, or `Materialize` cannot emit any output until they have processed their entire input dataset:
+
+- For a `Hash` node building an in-memory hash table for a hash join, every single row from the underlying child scan must be ingested and inserted into hash buckets before probe matching can begin.
+- Because row 1 cannot be emitted until the entire hash table is complete, the startup cost is equal to the total cost (e.g., `cost=8.30..8.30`).
+
+#### Why Startup Cost Matters in Query Optimization
+
+Understanding startup cost explains optimizer decisions for queries with `LIMIT` clauses:
+
+```sql
+SELECT * FROM comments ORDER BY created_at LIMIT 1;
+```
+
+- If PostgreSQL uses a sequential scan followed by a full sort, the sort node must absorb all 60,410 rows before returning row 1, resulting in a high startup cost.
+- If an index exists on `created_at`, an index scan can read the very first leaf pointer and return row 1 almost instantly (near-zero startup cost).
+- Even if the index scan has a higher _total_ cost for reading the entire table, the query planner chooses the index scan because the `LIMIT 1` clause only requires the startup phase to complete.
+
+### Hierarchical Cost Flow in Query Execution Plans
+
+PostgreSQL executes queries using tree-structured query plans. In these trees, execution costs flow **upward** from leaf nodes to parent nodes.
+
+Consider a multi-table query combining users and comments via a hash join:
+
+```sql
+EXPLAIN SELECT users.username, comments.body
+FROM users
+JOIN comments ON comments.user_id = users.id
+WHERE users.username = 'Alison';
+```
+
+A representative execution plan for this query appears as follows:
+
+```text
+                                  QUERY PLAN
+-------------------------------------------------------------------------------
+ Hash Join  (cost=8.31..1600.41 rows=10 width=116)
+   Hash Cond: (comments.user_id = users.id)
+   ->  Seq Scan on comments  (cost=0.00..1589.10 rows=60410 width=84)
+   ->  Hash  (cost=8.30..8.30 rows=1 width=36)
+         ->  Index Scan using users_username_idx on users  (cost=0.00..8.30 rows=1 width=36)
+               Index Cond: (username = 'Alison'::text)
+```
+
+#### How Parent Costs Accumulate
+
+A parent node's cost is computed by adding the costs of all its direct child nodes to the parent node's own intrinsic operational overhead:
+
+$$\text{Parent Total Cost} = \sum (\text{Child Total Costs}) + \text{Node's Intrinsic Processing Cost}$$
+
+```mermaid
+graph BT
+    subgraph LeafNodes["Leaf Execution Nodes"]
+        IS["Index Scan on users<br/>cost=0.00..8.30"]
+        SS["Seq Scan on comments<br/>cost=0.00..1589.10"]
+    end
+
+    subgraph BatchNode["Intermediate Batch Node"]
+        H["Hash Node<br/>cost=8.30..8.30<br/>(Waits for Index Scan to finish)"]
+    end
+
+    subgraph RootNode["Parent Join Node"]
+        HJ["Hash Join<br/>cost=8.31..1600.41<br/>(Startup = 8.30 + 0.00 + 0.01 = 8.31)"]
+    end
+
+    IS -->|"Feeds rows"| H
+    H -->|"Hash table ready"| HJ
+    SS -->|"Streams rows to probe"| HJ
+```
+
+#### Step-by-Step Breakdown of Cost Propagation
+
+1. **Index Scan on `users` (`cost=0.00..8.30`):**
+   - The index scan searches for `'Alison'`, incurring a total cost of $8.30$.
+2. **Hash Node (`cost=8.30..8.30`):**
+   - The hash node consumes the single record from the index scan and hashes it in memory.
+   - Because it must wait for the index scan to complete, its startup cost is $8.30$ and its total cost is $8.30$.
+3. **Sequential Scan on `comments` (`cost=0.00..1589.10`):**
+   - The sequential scan has a startup cost of $0.00$ because it streams comments immediately.
+   - Its total cost is $1589.10$.
+4. **Hash Join (`cost=8.31..1600.41`):**
+   - **Startup Cost ($8.31$):** To produce its first joined row, the Hash Join requires the inner hash table to be fully constructed ($8.30$) and the outer sequential scan to supply its first record ($0.00$), plus a negligible intrinsic setup cost ($0.01$):
+     $$\text{Startup Cost} = 8.30 + 0.00 + 0.01 = 8.31$$
+   - **Total Cost ($1600.41$):** The total cost includes the sequential scan ($1589.10$), the hash table preparation ($8.30$), and the CPU cost of probing the hash table and joining tuples ($~3.01$):
+     $$\text{Total Cost} = 1589.10 + 8.30 + 3.01 = 1600.41$$
+
+Costs consistently propagate from the bottom leaves upward to the root node of the query plan.
+
+### Index Selection Mechanics and the "Use My Index!" Dilemma
+
+A common misconception among database developers is that creating an index guarantees PostgreSQL will use it for queries filtering on that column. In reality, the query planner frequently bypasses existing indexes in favor of sequential scans.
+
+#### Anatomy of a Multi-Level B-Tree Index
+
+When a table grows large, a B-Tree index expands into multiple hierarchical levels:
+
+```text
++-----------------------------------------------------------------------------+
+|                    MULTI-LEVEL B-TREE INDEX ARCHITECTURE                    |
++-----------------------------------------------------------------------------+
+
+                             [ Root Node Page ]
+                                /          \
+                               /            \
+          [ Parent / Branch Page 1 ]     [ Parent / Branch Page 2 ]
+               /            \                 /            \
+        [ Leaf Page 1 ] [ Leaf Page 2 ] [ Leaf Page 3 ] [ Leaf Page 4 ]
+             |               |               |               |
+             +---------------+---------------+---------------+
+                             |
+                   Tuple Pointers (Block ID, Offset)
+                             |
+                             v
+           +-----------------------------------+
+           |         Table Heap File           |
+           |  [ Block 0 ] [ Block 1 ] ...      |
+           +-----------------------------------+
+```
+
+- **Root Node:** Directs searches to appropriate branch nodes based on key ranges.
+- **Parent / Branch Nodes:** Provide intermediate routing for large key spaces.
+- **Leaf Nodes:** Store indexed keys in sorted order alongside physical tuple pointers (`ctid`: Block ID and Item Offset) pointing to rows inside table heap pages.
+
+#### Case Study: The `likes` Table
+
+Consider a `likes` table tracking user engagement:
+
+- Total rows in `likes`: $750,000$
+- Column indexed: `created_at` (timestamp)
+
+```sql
+-- Create an explicit B-Tree index on created_at
+CREATE INDEX likes_created_at_idx ON likes (created_at);
+```
+
+#### Scenario 1: High Selectivity Query (Small Result Set)
+
+We query for likes created before January 1, 2013:
+
+```sql
+EXPLAIN SELECT * FROM likes WHERE created_at < '2013-01-01';
+```
+
+- **Matching Rows:** $63,000$ out of $750,000$ (~$8.4\%$ of the table).
+- **Execution Plan:**
+  ```text
+                               QUERY PLAN
+  -------------------------------------------------------------------------
+   Bitmap Heap Scan on likes  (cost=1214.20..14890.30 rows=63000 width=24)
+     Recheck Cond: (created_at < '2013-01-01'::timestamp)
+     ->  Bitmap Index Scan on likes_created_at_idx  (cost=0.00..1198.45 rows=63000 width=0)
+           Index Cond: (created_at < '2013-01-01'::timestamp)
+  ```
+
+Because only $8.4\%$ of rows match, PostgreSQL utilizes the index. It performs a **Bitmap Index Scan** (building a memory bitmap of target block locations from index leaves) followed by a **Bitmap Heap Scan** (reading target heap blocks in physical block order to minimize random seeking).
+
+#### Scenario 2: Low Selectivity Query (Large Result Set)
+
+Now invert the comparison operator from `<` to `>`:
+
+```sql
+EXPLAIN SELECT * FROM likes WHERE created_at > '2013-01-01';
+```
+
+- **Matching Rows:** $688,000$ out of $750,000$ (~$91.7\%$ of the table).
+- **Execution Plan:**
+  ```text
+                             QUERY PLAN
+  ------------------------------------------------------------------
+   Seq Scan on likes  (cost=0.00..15240.00 rows=688000 width=24)
+     Filter: (created_at > '2013-01-01'::timestamp)
+  ```
+
+Despite the index on `created_at`, PostgreSQL chooses a sequential scan.
+
+```mermaid
+flowchart TD
+    Q2["Query Filter: created_at > '2013-01-01' (91.7% of table)"] --> Eval{"Planner Evaluates Selectivity"}
+
+    Eval -->|"Attempt Index Scan"| IdxRoute["Read 90%+ of index leaf pages<br/>+ Random seeks across virtually every heap page<br/>High random_page_cost (4.0) penalty"]
+    Eval -->|"Attempt Sequential Scan"| SeqRoute["Read heap blocks sequentially from 0 to N<br/>Streamlined sequential I/O (seq_page_cost = 1.0)<br/>No index traversal overhead"]
+
+    IdxRoute --> CostHigh["Estimated Cost: High (~28,000+)"]
+    SeqRoute --> CostLow["Estimated Cost: Low (15,240.00)"]
+
+    CostHigh --> Decision{"Compare Costs"}
+    CostLow --> Decision
+
+    Decision -->|"Seq Scan Wins"| Winner["Planner Bypasses Index -> Runs Seq Scan"]
+```
+
+#### Why PostgreSQL Bypasses the Index
+
+When retrieving $91.7\%$ of a table:
+
+1. **Index Overhead:** PostgreSQL would have to traverse the index tree and read over $90\%$ of its leaf pages.
+2. **Random Heap I/O:** Each pointer in the leaf pages directs PostgreSQL to a heap block. Because nearly every physical heap page contains at least one matching row, PostgreSQL would end up loading almost every block in the table anyway.
+3. **Random Access Penalty:** Accessing those heap pages via index pointers causes out-of-order, random page reads ($4.0$ cost factor per page) rather than efficient sequential reads ($1.0$ cost factor).
+
+Reading the entire heap sequentially from start to finish is significantly faster than reading the index first and then jumping randomly across all heap blocks.
+
+#### Trade-off Matrix: Scan Strategies
+
+| Scan Method           | Best Used When                                                | Primary Advantage                                                    | Major Bottleneck                                    |
+| :-------------------- | :------------------------------------------------------------ | :------------------------------------------------------------------- | :-------------------------------------------------- |
+| **Index Scan**        | High selectivity (< 5% of rows).                              | Fetches only matching tuples; minimal disk reads.                    | Random disk seeks on heap lookups.                  |
+| **Bitmap Index Scan** | Moderate selectivity (5% - 20% of rows).                      | Sorts pointers into a block bitmap; visits heap blocks sequentially. | In-memory bitmap construction overhead.             |
+| **Sequential Scan**   | Low selectivity (> 20% of rows) or small tables (< 50 pages). | Optimal sequential streaming I/O; zero index traversal.              | Reads every page in table regardless of match rate. |
+
+> [!CAUTION]
+> **Do Not Attempt to Force Index Usage:**
+> A common question among engineers is _"Why isn't Postgres using my index, and how can I force it?"_
+>
+> PostgreSQL allows disabling sequential scans during debugging (`SET enable_seqscan = off;`), but forcing an index in production when the planner prefers a sequential scan will degrade performance. The planner has evaluated the I/O mathematics; when it selects a sequential scan over an index, sequential scanning is genuinely faster for that data distribution.
+
+> [!IMPORTANT]
+> **Index Hygiene and Dead Indexes:**
+> If a query consistently accesses a high percentage of rows, an index on that column provides no read benefit. Unused indexes continue to incur write penalties: every `INSERT`, `UPDATE`, and `DELETE` must write to the index tree, and the index consumes disk space and buffer memory.
+>
+> Always inspect execution plans with `EXPLAIN`. If an index is never selected by production query workloads, drop it:
+>
+> ```sql
+> DROP INDEX likes_created_at_idx;
+> ```
+
+### Interactive Knowledge Check Quiz
+
+<details>
+<summary><b>Question 1: Why is PostgreSQL query cost unitless rather than measured in seconds or milliseconds?</b></summary>
+<br>
+<b>Answer:</b> Execution time varies constantly based on concurrent server load, CPU frequency, disk controller latency, and whether pages reside in memory cache or physical storage. Because wall-clock time cannot be predicted deterministically without executing the query, PostgreSQL uses a unitless score calibrated against a baseline (where fetching one 8 KB disk page sequentially equals 1.0) to compare candidate plans relative to each other.
+</details>
+
+<details>
+<summary><b>Question 2: In an EXPLAIN output like <code>Seq Scan on comments (cost=0.00..1589.10 rows=60410)</code>, why is the startup cost listed as 0.00?</b></summary>
+<br>
+<b>Answer:</b> A sequential scan is a streaming (pipelined) node. Once the query engine opens the first disk block, it can immediately process and emit the very first matching row to the parent node without waiting to read the rest of the table. PostgreSQL models this immediate start as a 0.00 startup cost, unlike batch nodes (such as Hash or Sort) which must consume all input rows before emitting their first output row.
+</details>
+
+<details>
+<summary><b>Question 3: Why does a Hash node have identical startup and total costs (e.g., <code>cost=8.30..8.30</code>)?</b></summary>
+<br>
+<b>Answer:</b> A Hash node is a "stop-and-wait" (batching) operation. It cannot construct a partial hash table and emit rows; it must ingest, hash, and store 100% of the tuples from its child scan before any probe or join operation can begin. Because emitting the very first row requires completing the entire hash table, its startup cost equals its total cost.
+</details>
+
+<details>
+<summary><b>Question 4: Given a table with 985 sequential pages and 60,410 rows, explain how PostgreSQL calculates the total cost of 1589.10 for a sequential scan without filters.</b></summary>
+<br>
+<b>Answer:</b> PostgreSQL sums the disk I/O cost and CPU processing cost using its default planner constants:
+<br><br>
+$$\text{Disk I/O Cost} = 985 \text{ pages} \times 1.0\ (\text{seq\_page\_cost}) = 985.0$$
+$$\text{CPU Cost} = 60,410 \text{ rows} \times 0.01\ (\text{cpu\_tuple\_cost}) = 604.10$$
+$$\text{Total Cost} = 985.0 + 604.10 = 1589.10$$
+</details>
+
+<details>
+<summary><b>Question 5: Why does PostgreSQL ignore an existing B-Tree index and revert to a sequential scan when a query's filter matches 90% of the rows in a table?</b></summary>
+<br>
+<b>Answer:</b> When a query matches a high percentage of rows, an index scan would require reading almost all index leaf pages and then executing random disk lookups for virtually every heap data block in the table. Because random disk access carries a steep penalty factor (<code>random_page_cost = 4.0</code>), navigating the index and seeking heap blocks randomly is far more expensive than simply reading the entire heap file sequentially from start to finish at <code>seq_page_cost = 1.0</code>.
 </details>
