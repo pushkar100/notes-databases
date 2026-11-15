@@ -94,6 +94,7 @@
       + [PostgreSQL Index Types: B-Tree and Specialized Variants](#postgresql-index-types-b-tree-and-specialized-variants)
       + [Automatically Generated Indexes: Primary Keys and Unique Constraints](#automatically-generated-indexes-primary-keys-and-unique-constraints)
       + [Deep Dive: Physical Storage and Anatomy of B-Tree Indexes with Pageinspect](#deep-dive-physical-storage-and-anatomy-of-b-tree-indexes-with-pageinspect)
+   * [The Query Processing Pipeline](#the-query-processing-pipeline)
 
 
 <!-- TOC end -->
@@ -4251,4 +4252,520 @@ When a table grows to hundreds of thousands or millions of records (such as a `l
 <summary><b>Question 7: How do you verify the physical row location corresponding to an index pointer in PostgreSQL?</b></summary>
 <br>
 <b>Answer:</b> By querying PostgreSQL's hidden system column `ctid` (e.g., `SELECT ctid, * FROM users WHERE username = '...';`), which directly outputs the `(block_number, offset)` matching the index's pointer.
+</details>
+
+
+## Query Processing Pipeline, EXPLAIN Plans, and Execution Statistics
+
+### The Query Processing Pipeline
+
+Understanding how PostgreSQL executes a query is the prerequisite for designing high-performance databases. While indexes are powerful tools to accelerate record retrieval, indexing every single column degrades write performance and consumes significant memory and disk space. To evaluate whether a table or column genuinely needs an index, we must first understand the internal lifecycle a query undergoes from the moment a client sends a SQL string to the moment rows are returned.
+
+Every query submitted to PostgreSQL transitions through four distinct architectural stages: the **Parser**, the **Rewriter**, the **Planner (Optimizer)**, and the **Executor**.
+
+```text
++-----------------------------------------------------------------------------------+
+|                        POSTGRESQL QUERY PROCESSING PIPELINE                       |
++-----------------------------------------------------------------------------------+
+|                                                                                   |
+|   Client Query: "SELECT * FROM users WHERE username = 'Allison.14';"              |
+|         |                                                                         |
+|         v                                                                         |
+|   +---------------+                                                               |
+|   | 1. PARSER     |  --> Checks SQL syntax & grammar.                             |
+|   +---------------+  --> Generates programmatic Parse Tree / Query Tree.          |
+|         |                                                                         |
+|         v                                                                         |
+|   +---------------+                                                               |
+|   | 2. REWRITER   |  --> Applies database rule system.                            |
+|   +---------------+  --> Expands views into underlying base queries.              |
+|         |                                                                         |
+|         v                                                                         |
+|   +---------------+                                                               |
+|   | 3. PLANNER    |  --> Evaluates execution paths (Index Scan vs. Seq Scan).     |
+|   +---------------+  --> Uses table statistics to select the lowest-cost plan.    |
+|         |                                                                         |
+|         v                                                                         |
+|   +---------------+                                                               |
+|   | 4. EXECUTOR   |  --> Executes physical plan operations via buffer manager.    |
+|   +---------------+  --> Fetches disk pages, evaluates filters, returns tuples.   |
+|         |                                                                         |
+|         v                                                                         |
+|   Result Rows: [ id: 14, username: "Allison.14", email: "allison@example.com" ]   |
+|                                                                                   |
++-----------------------------------------------------------------------------------+
+```
+
+#### Architectural Stages of Query Processing
+
+```mermaid
+flowchart TD
+    SQL["Raw SQL String\n('SELECT * FROM users WHERE username = ...')"] --> Parser["1. Parser\n(Syntax check & tokenization)"]
+    Parser --> QTree["Query Tree / Parse Tree\n(Programmatic representation)"]
+    QTree --> Rewriter["2. Rewriter\n(View substitution & rule application)"]
+    Rewriter --> RewrittenTree["Rewritten Query Tree"]
+    RewrittenTree --> Planner["3. Planner / Optimizer\n(Cost-based path selection)"]
+    Planner --> ExecPlan["Optimal Execution Plan\n(Plan tree: Index Scan / Seq Scan)"]
+    ExecPlan --> Executor["4. Executor\n(Disk access & buffer pool evaluation)"]
+    Executor --> Result["Emitted Row Tuples to Client"]
+```
+
+#### Stage 1: The Parser and the Query Tree
+
+When raw SQL text arrives at the PostgreSQL server process, the Parser breaks down the character sequence into lexical tokens (keywords, literals, identifiers, and operators).
+
+The Parser performs two primary duties:
+
+1. **Grammar & Syntax Validation:** It verifies whether the statement complies with valid SQL syntax. If a keyword is misspelled (e.g., `SELEC` instead of `SELECT`) or punctuation is invalid, execution halts immediately with a syntax error.
+2. **Query Tree Generation:** It transforms the raw string into an internal structural representation called a **Query Tree** (or Parse Tree).
+
+The Query Tree deconstructs the query into distinct programmatic nodes:
+
+- **Statement Type (`commandType`):** Identifies whether the operation is `SELECT`, `INSERT`, `UPDATE`, or `DELETE`.
+- **Target List (`targetList`):** Represents the requested output attributes (e.g., all attributes for `*`, or explicit column references).
+- **Range Table (`rangeTable`):** Identifies the target relations (tables) accessed by the query (e.g., the `users` table).
+- **Qualification Clause (`qual`):** Contains the boolean filter condition from the `WHERE` clause structured as an operator expression tree (e.g., the equality operator `=` applied between the column identifier `username` and the string constant `'Allison.14'`).
+
+```text
++-------------------------------------------------------------+
+|               PROGRAMMATIC QUERY TREE BREAKDOWN             |
++-------------------------------------------------------------+
+| SelectStmt                                                  |
+|   |-- targetList: [ ResTarget (val: ColumnRef "*") ]        |
+|   |-- fromClause: [ RangeVar (relname: "users") ]           |
+|   \-- whereClause: A_Expr                                   |
+|         |-- kind: AEXPR_OP ("=")                            |
+|         |-- lexpr: ColumnRef ("username")                   |
+|         \-- rexpr: A_Const ("Allison.14")                   |
++-------------------------------------------------------------+
+```
+
+#### Stage 2: The Rewriter and View Expansion
+
+The Rewriter receives the Query Tree from the Parser and applies the PostgreSQL rule system.
+
+Its primary function is **view expansion**:
+
+- Views in relational databases are stored queries rather than physically materialized tables.
+- When a query references a view, the Rewriter intercepts the view reference in the Query Tree and substitutes it with the underlying `SELECT` statement that defines the view.
+- If no rules or views apply, the Rewriter passes the query tree forward with minor structural adjustments.
+
+> [!TIP]
+> Because the Rewriter expands views into subqueries before planning, querying a view incurs virtually no execution overhead compared to writing out the underlying join or filter query by hand. The Planner optimizes the unified tree in a single pass.
+
+#### Stage 3: The Planner (Optimizer) and Path Selection
+
+The Planner is the most critical component for database performance engineering. It takes the rewritten Query Tree and determines the most efficient physical strategy to retrieve the requested records.
+
+A single query can often be answered through several distinct execution strategies:
+
+- **Plan A (Index Scan):** Navigate the `users_username_idx` B-Tree index to locate the specific heap tuple pointer matching `'Allison.14'`, then perform a targeted disk read into the `users` heap file.
+- **Plan B (Sequential Scan):** Read every block of the `users` table sequentially from disk, evaluating the string comparison `username = 'Allison.14'` on every individual row.
+- **Plan C (Bitmap Index Scan):** Construct a memory bitmap of matching block locations from the index before reading the table blocks in physical sequence.
+
+The Planner calculates an estimated **cost** for each candidate plan based on disk I/O operations and CPU cycle overhead, referencing table statistics maintained in the PostgreSQL system catalogs. The plan with the lowest estimated cost is selected and passed to the Executor.
+
+> [!NOTE]
+> Database developers have direct influence over the Planner. By adding indexes, writing clean queries, keeping table statistics up to date, and tuning server configuration parameters, engineers guide the Planner to select optimal execution strategies.
+
+#### Stage 4: The Executor and Storage Retrieval
+
+The Executor accepts the execution plan from the Planner and carries out the actual data retrieval:
+
+1. It traverses the execution plan nodes recursively.
+2. It calls into the PostgreSQL buffer manager to read required 8 KB data pages into the shared buffer cache (or fetches them from disk if not cached).
+3. It evaluates filtering predicates, performs hash matches or sorts, and projects the final requested columns.
+4. It streams the resulting rows back across the client connection.
+
+#### Query Processing Component Comparison
+
+| Component    | Primary Responsibility                 | Input Artifact       | Output Artifact         | Developer Influence                  |
+| :----------- | :------------------------------------- | :------------------- | :---------------------- | :----------------------------------- |
+| **Parser**   | Syntax validation & lexical analysis   | Raw SQL string       | Query Tree (Parse Tree) | Syntax correctness                   |
+| **Rewriter** | Rule transformations & view expansion  | Query Tree           | Rewritten Query Tree    | Schema & view design                 |
+| **Planner**  | Cost-based execution path optimization | Rewritten Query Tree | Physical Execution Plan | Indexes, query structure, statistics |
+| **Executor** | Physical data retrieval & computation  | Execution Plan       | Emitted Result Tuples   | Hardware, buffer pool sizing         |
+
+#### Practical Demonstration: Syntax Validation in the Parser
+
+When queries are sent to PostgreSQL, the parser validates keyword syntax and structure before any disk reads or table access occurs.
+
+```sql
+-- Valid SQL Query: Successfully passes Parser, Rewriter, Planner, and Executor
+SELECT id, username, email
+FROM users
+WHERE username = 'Allison.14';
+
+-- Syntax Error: Caught immediately by the Parser before entering the Planner
+SELEC id, username, email
+FROM users
+WHERE username = 'Allison.14';
+```
+
+##### Expected Output Sample
+
+```text
+-- Output from the valid query:
+ id |  username  |         email
+----+------------+-----------------------
+ 14 | Allison.14 | allison@example.com
+(1 row)
+
+-- Output from the malformed query:
+ERROR:  syntax error at or near "SELEC"
+LINE 1: SELEC id, username, email
+        ^
+```
+
+### Inspecting Query Plans with EXPLAIN and EXPLAIN ANALYZE
+
+The Planner operates as a cost-based optimization engine, but its decisions are typically hidden from view. To inspect which path the Planner selected, PostgreSQL provides two primary keywords: `EXPLAIN` and `EXPLAIN ANALYZE`.
+
+```text
++-----------------------------------------------------------------------------------+
+|                        EXPLAIN vs. EXPLAIN ANALYZE COMPARISON                     |
++-----------------------------------------------------------------------------------+
+|                                                                                   |
+|  EXPLAIN <query>;                                                                 |
+|    - Generates the execution plan using catalog statistics.                       |
+|    - DOES NOT execute the query.                                                  |
+|    - Safe to run on destructive statements (e.g., DELETE, UPDATE).                |
+|    - Outputs ESTIMATED costs, row counts, and byte widths.                        |
+|                                                                                   |
+|  EXPLAIN ANALYZE <query>;                                                         |
+|    - Generates the execution plan AND RUNS the query to completion.               |
+|    - Measures REAL runtime performance.                                           |
+|    - DANGEROUS on destructive statements (modifications persist!).                |
+|    - Outputs ESTIMATED metrics AND ACTUAL metrics (timing, row counts, loops).    |
+|                                                                                   |
++-----------------------------------------------------------------------------------+
+```
+
+#### EXPLAIN: Static Cost and Cardinality Estimation
+
+Prepending `EXPLAIN` to any SQL statement instructs PostgreSQL to compile the execution plan and output the structural tree along with estimated metrics, **without running the underlying query**.
+
+```mermaid
+flowchart LR
+    subgraph S1["EXPLAIN Workflow"]
+        Q1["SQL Query"] --> P1["Planner Engine"]
+        P1 --> D1["Read System Catalogs (pg_stats)"]
+        D1 --> E1["Estimated Query Plan\n(cost, rows, width)"]
+    end
+
+    subgraph S2["EXPLAIN ANALYZE Workflow"]
+        Q2["SQL Query"] --> P2["Planner Engine"]
+        P2 --> E2["Estimated Query Plan"]
+        E2 --> X2["Executor Engine\n(Runs Query on Disk/Buffer)"]
+        X2 --> R2["Estimated + Actual Metrics\n(actual time, actual rows, loops)"]
+    end
+```
+
+Key characteristics of `EXPLAIN`:
+
+- **Zero I/O Execution:** Because the query does not actually execute, it returns instantaneously even on tables with tens of millions of rows.
+- **Hypothetical Estimates:** All reported numbers (`cost`, `rows`, and `width`) are theoretical estimates derived purely from database catalog statistics.
+- **Data Suppression:** The database does not return application rows; it outputs a single column containing text lines representing the execution plan.
+
+#### EXPLAIN ANALYZE: Real-World Execution Profiling
+
+Prepending `EXPLAIN ANALYZE` instructs PostgreSQL to generate the plan, **execute the statement in full**, and output both the original estimates alongside the real runtime statistics.
+
+Key characteristics of `EXPLAIN ANALYZE`:
+
+- **Real Execution:** PostgreSQL executes the query from start to finish, reading buffer pages and disk blocks, filtering records, and computing joins.
+- **Actual Timing & Counts:** In addition to estimated costs, it provides:
+  - `actual time=startup..total`: Real time in milliseconds to retrieve the first row and to complete the node.
+  - `actual rows=N`: The exact number of rows produced by that node.
+  - `loops=N`: The number of times that specific node was executed.
+  - `Planning Time`: Time in milliseconds taken by the Planner to determine the plan.
+  - `Execution Time`: Total wall-clock time in milliseconds taken by the Executor.
+
+> [!CAUTION]
+> Because `EXPLAIN ANALYZE` actually executes the query, running `EXPLAIN ANALYZE DELETE FROM users;` will permanently delete your data! To profile mutations safely, wrap them in a rolled-back transaction:
+>
+> ```sql
+> BEGIN;
+> EXPLAIN ANALYZE DELETE FROM users WHERE created_at < NOW() - INTERVAL '1 year';
+> ROLLBACK;
+> ```
+
+> [!IMPORTANT]
+> Never include `EXPLAIN` or `EXPLAIN ANALYZE` in application production queries. These keywords instruct the PostgreSQL engine to emit plan diagnostics instead of row records, which breaks application data mappers and ORMs.
+
+#### Tooling: pgAdmin Visual Explain vs. psql CLI
+
+PostgreSQL developers profile queries using both terminal-based interfaces (`psql`) and graphical database management clients (`pgAdmin`).
+
+- **pgAdmin Visual Explain Button:** Located beside the standard "Execute" button in the Query Tool toolbar. It displays an interactive graphical tree of operations.
+- **pgAdmin Dropdown Options:** Enables configuration toggles for _Costs_, _Buffers_, _Timing_, and _Verbose_.
+- **Why CLI Mastery is Essential:** Production database servers are typically accessible only via headless SSH bastion hosts and command-line `psql`. Graphical tools cannot connect directly to locked-down environments, making terminal proficiency mandatory.
+
+#### Diagnostic Tool Comparison
+
+| Diagnostic Tool        | Query Actually Runs? | Side Effects on Data?       | Available Metrics                                                            | Best Use Case                                                 |
+| :--------------------- | :------------------- | :-------------------------- | :--------------------------------------------------------------------------- | :------------------------------------------------------------ |
+| **`EXPLAIN`**          | No                   | None (100% safe)            | Estimated cost, rows, width                                                  | Production checks, long-running queries, dry runs of DDL/DML  |
+| **`EXPLAIN ANALYZE`**  | **Yes**              | **Yes** (Mutations persist) | Estimated costs + actual time (ms), actual rows, loop counts, execution time | Detailed staging profiling, identifying inaccurate statistics |
+| **pgAdmin Visualizer** | Depends on toggle    | Yes (if Analyze selected)   | Graphical flow charts, node cost percentages, buffer statistics              | Learning plan hierarchies, visual walkthroughs in development |
+
+#### Practical Walkthrough: Profiling a Relational Join
+
+Consider a relational join retrieving all comments authored by a specific user (`Allison.14`):
+
+```sql
+-- Step 1: Standard query fetching records
+SELECT username, contents
+FROM users
+JOIN comments ON comments.user_id = users.id
+WHERE username = 'Allison.14';
+
+-- Step 2: Static estimation without running the query
+EXPLAIN
+SELECT username, contents
+FROM users
+JOIN comments ON comments.user_id = users.id
+WHERE username = 'Allison.14';
+
+-- Step 3: Full execution with real runtime benchmarking
+EXPLAIN ANALYZE
+SELECT username, contents
+FROM users
+JOIN comments ON comments.user_id = users.id
+WHERE username = 'Allison.14';
+```
+
+##### Expected Output Sample: Standard Query
+
+```text
+  username  |               contents
+------------+--------------------------------------
+ Allison.14 | Great explanation of query planning!
+ Allison.14 | Indexes really make a huge difference.
+(2 rows)
+```
+
+##### Expected Output Sample: EXPLAIN (Pure Estimate)
+
+```text
+                                        QUERY PLAN
+------------------------------------------------------------------------------------------
+ Hash Join  (cost=8.30..1765.41 rows=11 width=81)
+   Hash Cond: (comments.user_id = users.id)
+   ->  Seq Scan on comments  (cost=0.00..1570.00 rows=60000 width=72)
+   ->  Hash  (cost=8.29..8.29 rows=1 width=13)
+         ->  Index Scan using users_username_idx on users  (cost=0.29..8.29 rows=1 width=13)
+               Index Cond: (username = 'Allison.14'::text)
+(6 rows)
+```
+
+##### Expected Output Sample: EXPLAIN ANALYZE (Actual Runtime Metrics)
+
+```text
+                                                       QUERY PLAN
+------------------------------------------------------------------------------------------------------------------------
+ Hash Join  (cost=8.30..1765.41 rows=11 width=81) (actual time=0.082..12.431 rows=2 loops=1)
+   Hash Cond: (comments.user_id = users.id)
+   ->  Seq Scan on comments  (cost=0.00..1570.00 rows=60000 width=72) (actual time=0.012..8.140 rows=60000 loops=1)
+   ->  Hash  (cost=8.29..8.29 rows=1 width=13) (actual time=0.045..0.046 rows=1 loops=1)
+         Buckets: 1024  Batches: 1  Memory Usage: 9kB
+         ->  Index Scan using users_username_idx on users  (cost=0.29..8.29 rows=1 width=13) (actual time=0.038..0.039 rows=1 loops=1)
+               Index Cond: (username = 'Allison.14'::text)
+ Planning Time: 0.285 ms
+ Execution Time: 12.488 ms
+(9 rows)
+```
+
+### Deconstructing Query Plans and Estimations with pg_stats
+
+When reviewing a query plan, a central question arises: **How can PostgreSQL estimate that a query will produce exactly 11 rows with an average width of 81 bytes when running `EXPLAIN` without touching a single table or index page on disk?**
+
+The answer lies in PostgreSQL's internal statistics collector and the `pg_stats` system catalog.
+
+```text
++-----------------------------------------------------------------------------------+
+|                        READING QUERY PLAN TREE DATAFLOW                           |
++-----------------------------------------------------------------------------------+
+|                                                                                   |
+|  Hash Join (cost=8.30..1765.41 rows=11 width=81)                                  |
+|    |                                                                              |
+|    |  <-- [Emitted User Hash Table]        <-- [Emitted 60,000 Comment Rows]      |
+|    |                                                                              |
+|    |-- Hash (cost=8.29..8.29 rows=1 width=13)                                     |
+|    |     \-- Index Scan using users_username_idx on users                         |
+|    |           (Finds 1 matching user tuple and passes to Hash)                   |
+|    |                                                                              |
+|    \-- Seq Scan on comments (cost=0.00..1570.00 rows=60000 width=72)              |
+|          (Scans entire comments table and probes against Hash table)              |
+|                                                                                   |
++-----------------------------------------------------------------------------------+
+```
+
+#### Reading the Query Plan Tree (Inside-Out Execution Flow)
+
+```mermaid
+flowchart TD
+    IdxScan["1. Index Scan on users\n(using users_username_idx)\n[Locates 'Allison.14' tuple]"] -->|"Emits 1 user tuple"| HashNode["2. Hash Operation\n(Builds in-memory hash table of user IDs)"]
+    HashNode -->|"Emits hash table"| HashJoin["4. Hash Join Node\n(Probes comment rows against user hash table)"]
+    SeqScan["3. Seq Scan on comments\n(Reads all 60,000 comment rows)"] -->|"Streams comment rows"| HashJoin
+    HashJoin --> FinalResult["Emits Final Combined Rows\n(username + contents)"]
+```
+
+Query plans are structured as trees composed of individual operations called **Query Nodes**:
+
+1. **Node Indicators:** Every line prefixed with an arrow `->` represents an individual processing node. The very top line (e.g., `Hash Join`) is also a query node (the root node).
+2. **Indentation and Execution Flow:** The plan is evaluated **from the inside out (deepest indentation first)**:
+   - The innermost node—`Index Scan using users_username_idx on users`—executes first.
+   - It retrieves the matching tuple from the `users` table and passes it up to its immediate parent node: the `Hash` node.
+   - The `Hash` node processes the user record, constructing an in-memory hash table keyed on `users.id`, and makes it available to the `Hash Join` parent node.
+   - Concurrently, the `Seq Scan on comments` node reads rows sequentially from the `comments` table and feeds them into the `Hash Join` node.
+   - The `Hash Join` node matches `comments.user_id` against the in-memory hash table, emitting joining pairs as the final query result.
+
+#### Anatomy of a Plan Node: Cost, Rows, and Width
+
+Every node header contains four fundamental attributes:
+
+```text
+Hash Join  (cost=8.30..1765.41 rows=11 width=81)
+^^^^^^^^^   ^^^^^^^^^^^^^^^^^  ^^^^^^^  ^^^^^^^^
+  Node         Estimated       Est.     Average
+  Type           Cost          Rows      Bytes
+```
+
+1. **Node Type (`Hash Join`):** The physical algorithm executed by the database engine (e.g., `Seq Scan`, `Index Scan`, `Hash Join`, `Nested Loop`, `Merge Join`).
+2. **Estimated Cost (`cost=8.30..1765.41`):**
+   - Expressed in arbitrary cost units relative to the cost of a single sequential page disk read (`seq_page_cost = 1.0`).
+   - **Startup Cost (`8.30`):** The cost required before the node emits its very first row.
+   - **Total Cost (`1765.41`):** The cumulative cost required to run the node to completion.
+3. **Estimated Rows (`rows=11`):** The estimated cardinality (number of rows) this specific node will emit.
+4. **Estimated Width (`width=81`):** The average size in bytes of each row emitted by this node.
+
+#### Solving the Estimation Mystery: The pg_stats System View
+
+When running `EXPLAIN` without `ANALYZE`, PostgreSQL does not read table records or traverse index trees. Yet, it accurately predicts row counts and byte widths.
+
+PostgreSQL maintains an internal metadata repository populated by the background `autovacuum` daemon and manual `ANALYZE` commands, exposed via the `pg_stats` system view.
+
+```sql
+-- Inspecting column statistics for the users table
+SELECT
+    attname,
+    null_frac,
+    avg_width,
+    n_distinct,
+    most_common_vals,
+    most_common_freqs
+FROM pg_stats
+WHERE tablename = 'users';
+```
+
+##### Expected Output Sample: Inspecting pg_stats
+
+```text
+ attname  | null_frac | avg_width | n_distinct |    most_common_vals    |     most_common_freqs
+----------+-----------+-----------+------------+------------------------+---------------------------
+ id       |         0 |         4 |         -1 |                        |
+ username |         0 |        13 |         -1 |                        |
+ bio      |      0.05 |        45 |      -0.95 |                        |
+ status   |         0 |         7 |          2 | {offline,online}       | {0.50133334,0.49866667}
+(4 rows)
+```
+
+#### Calculating Emitted Tuple Width
+
+In our query plan:
+
+- The requested columns are `users.username` and `comments.contents`.
+- Querying `pg_stats` shows that the average byte width (`avg_width`) for `users.username` is **13 bytes**.
+- Querying `pg_stats` for `comments.contents` shows an average width of **68 bytes**.
+- Combining these two projected attributes ($13 + 68$) yields the **81 bytes** reported as `width=81` on the `Hash Join` node!
+
+#### Decoding Key pg_stats Columns
+
+| Catalog Column                | Description & Meaning                                                                 | How the Planner Uses It                                                                                                                        |
+| :---------------------------- | :------------------------------------------------------------------------------------ | :--------------------------------------------------------------------------------------------------------------------------------------------- |
+| **`attname`**                 | Name of the table column                                                              | Identifies the column being analyzed.                                                                                                          |
+| **`null_frac`**               | Fraction of column values that are `NULL` (e.g., `0.05` = 5%)                         | Adjusts row estimates when queries include `IS NULL` or `IS NOT NULL`.                                                                         |
+| **`avg_width`**               | Average width in bytes of non-null column values                                      | Determines memory allocation for work buffers, sorting, and hash tables.                                                                       |
+| **`n_distinct`**              | Number of distinct values in the column                                               | If $> 0$: exact distinct count.<br>If $< 0$: negative fraction of total rows (e.g., `-1` indicates unique keys like IDs and unique usernames). |
+| **`most_common_vals` (MCV)**  | Array of the most frequent individual values                                          | Provides exact frequency data for non-uniformly distributed data.                                                                              |
+| **`most_common_freqs` (MCF)** | Array of decimal frequencies matching the MCV list                                    | Used to calculate selectivity multipliers for equality queries (e.g., `WHERE status = 'offline'`).                                             |
+| **`histogram_bounds`**        | Bounding values that divide non-MCV values into equal buckets                         | Used to compute selectivity for range searches (`WHERE age BETWEEN 20 AND 30`).                                                                |
+| **`correlation`**             | Statistical correlation between physical disk storage order and logical value sorting | High correlation ($\approx 1.0$) means index scans will read sequential disk blocks, dramatically reducing random I/O costs.                   |
+
+> [!NOTE]
+> When statistics are stale after massive data changes, the Planner's estimates drift from reality, causing it to choose inefficient strategies (such as a slow Sequential Scan over an Index Scan). Always refresh statistics with `ANALYZE [table_name];` after bulk operations.
+
+#### Join Algorithm Selection
+
+| Join Strategy   | How It Works                                                                                            | Ideal Scenario                                                                                            | Weakness                                                                                        |
+| :-------------- | :------------------------------------------------------------------------------------------------------ | :-------------------------------------------------------------------------------------------------------- | :---------------------------------------------------------------------------------------------- |
+| **Hash Join**   | Builds an in-memory hash table from the smaller relation, then scans the larger relation to probe keys. | Joining a small/medium filtered set with a large table without indexes on join keys.                      | Requires sufficient memory (`work_mem`); spills to temporary disk files if memory is exceeded.  |
+| **Nested Loop** | For every outer row, searches the inner relation (typically using an index).                            | When the outer relation has very few rows (1 to 100) and the inner relation has an index on the join key. | Performance degrades exponentially if the outer set contains thousands of rows without indexes. |
+| **Merge Join**  | Both inputs must be sorted by the join key; streams both inputs in lockstep.                            | Both relations are already sorted (e.g., via B-Tree indexes) or data sets are very large.                 | Requires an upfront sort step if relations are not pre-indexed.                                 |
+
+#### Practical Walkthrough: Querying Statistics and Verifying Estimates
+
+```sql
+-- Step 1: Query the statistics table for status column distributions
+SELECT attname, n_distinct, most_common_vals, most_common_freqs
+FROM pg_stats
+WHERE tablename = 'users' AND attname = 'status';
+
+-- Step 2: Run an EXPLAIN query filtering on the most common value
+EXPLAIN SELECT * FROM users WHERE status = 'offline';
+```
+
+##### Expected Output Sample
+
+```text
+-- Step 1 Output:
+ attname | n_distinct | most_common_vals |   most_common_freqs
+---------+------------+------------------+-----------------------
+ status  |          2 | {offline,online} | {0.5013333,0.4986667}
+(1 row)
+
+-- Step 2 Output:
+                                  QUERY PLAN
+------------------------------------------------------------------------------
+ Seq Scan on users  (cost=0.00..180.00 rows=5013 width=118)
+   Filter: ((status)::text = 'offline'::text)
+(2 rows)
+```
+
+_Notice how the Planner estimates `rows=5013` out of 10,000 total table rows because `most_common_freqs` specifies that `offline` represents exactly 50.133% of records._
+
+### Review Quiz
+
+<details>
+<summary><b>Question 1: What is the primary operational difference between the Parser, Planner, and Executor stages?</b></summary>
+<br>
+<b>Answer:</b> The <b>Parser</b> checks syntax and builds a programmatic Query Tree; the <b>Planner</b> evaluates candidate access paths (Index Scan vs. Seq Scan) and uses statistics to choose the lowest-cost plan; and the <b>Executor</b> runs the chosen physical plan against disk and buffer cache to return rows.
+</details>
+
+<details>
+<summary><b>Question 2: What is the fundamental difference between EXPLAIN and EXPLAIN ANALYZE?</b></summary>
+<br>
+<b>Answer:</b> <code>EXPLAIN</code> generates the plan and cost estimates using catalog statistics without running the query. <code>EXPLAIN ANALYZE</code> generates the plan and <b>actually executes the query</b>, reporting real runtime duration, actual row counts, and loop statistics.
+</details>
+
+<details>
+<summary><b>Question 3: How should an engineer safely run EXPLAIN ANALYZE on a destructive query (such as DELETE or UPDATE)?</b></summary>
+<br>
+<b>Answer:</b> Execute it within an explicit transaction block and roll it back immediately:
+<pre><code>BEGIN;
+EXPLAIN ANALYZE DELETE FROM ...;
+ROLLBACK;</code></pre>
+</details>
+
+<details>
+<summary><b>Question 4: In what order are execution plan node trees evaluated?</b></summary>
+<br>
+<b>Answer:</b> Plan trees are evaluated <b>bottom-up and inside-out</b>. The deepest indented child nodes execute first and pass their emitted data tuples upward to their parent nodes.
+</details>
+
+<details>
+<summary><b>Question 5: How does PostgreSQL accurately estimate row count and byte width in an EXPLAIN command without reading table data?</b></summary>
+<br>
+<b>Answer:</b> It consults the <b><code>pg_stats</code></b> system catalog view. PostgreSQL maintains precomputed statistics (such as <code>avg_width</code>, <code>n_distinct</code>, and <code>most_common_freqs</code>) that allow the Planner to estimate tuple sizes and cardinalities prior to physical execution.
 </details>
