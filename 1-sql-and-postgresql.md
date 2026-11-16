@@ -96,6 +96,7 @@
       + [Deep Dive: Physical Storage and Anatomy of B-Tree Indexes with Pageinspect](#deep-dive-physical-storage-and-anatomy-of-b-tree-indexes-with-pageinspect)
    * [Query Tuning Basics](#query-tuning-basics)
    * [Advanced Query Tuning](#advanced-query-tuning)
+   * [Recursive Common Table Expressions (CTEs)](#recursive-common-table-expressions-ctes)
 
 
 <!-- TOC end -->
@@ -5332,4 +5333,304 @@ $$\text{Total Cost} = 985.0 + 604.10 = 1589.10$$
 <summary><b>Question 5: Why does PostgreSQL ignore an existing B-Tree index and revert to a sequential scan when a query's filter matches 90% of the rows in a table?</b></summary>
 <br>
 <b>Answer:</b> When a query matches a high percentage of rows, an index scan would require reading almost all index leaf pages and then executing random disk lookups for virtually every heap data block in the table. Because random disk access carries a steep penalty factor (<code>random_page_cost = 4.0</code>), navigating the index and seeking heap blocks randomly is far more expensive than simply reading the entire heap file sequentially from start to finish at <code>seq_page_cost = 1.0</code>.
+</details>
+
+
+## Recursive Common Table Expressions (CTEs)
+
+### The Big Picture: What is a Recursive CTE?
+
+In SQL, a normal Common Table Expression (CTE) created with the `WITH` keyword is just a handy way to write a temporary query and give it a name, like an alias or a helper view.
+
+A **Recursive CTE** (written with `WITH RECURSIVE`) is completely different. **Think of a recursive CTE as a loop inside SQL.** It takes a starting row, runs an operation on it, takes the result, runs the operation again, and keeps repeating until there is nothing left to process.
+
+> [!NOTE]
+> Recursive CTEs are widely considered one of the most challenging topics in SQL. You do **not** need to memorize how to write them from scratch right away. Your main goal right now is simply to understand **what they do** and recognize **when to use one** (such as when working with hierarchies or recommendations).
+
+```text
++-----------------------------------------------------------------------------+
+|                     THE 3 PARTS OF A RECURSIVE CTE                          |
+|                                                                             |
+|  WITH RECURSIVE my_cte(columns) AS (                                        |
+|      -- 1. THE STARTING QUERY (Non-Recursive)                               |
+|      SELECT ...                                                             |
+|      (Runs once at the very start to give us our initial rows)              |
+|                                                                             |
+|      UNION                                                                  |
+|      (Glues all our rounds of results together)                             |
+|                                                                             |
+|      -- 2. THE REPEAT QUERY (Recursive)                                     |
+|      SELECT ... FROM my_cte WHERE ...                                       |
+|      (Runs over and over on the latest rows until a condition stops it)     |
+|  )                                                                          |
+|  -- 3. THE FINAL QUERY (Outer Query)                                        |
+|  SELECT * FROM my_cte;                                                      |
+|  (Reads and displays the final collected results)                           |
++-----------------------------------------------------------------------------+
+```
+
+Every recursive CTE always has these three parts:
+
+1. **Initial (Non-Recursive) Query:** The starting point located above the `UNION`. It runs only once to give the loop its initial data.
+2. **The `UNION` Keyword:** Every recursive CTE must have a `UNION` keyword to combine each round's results into one list.
+3. **Recursive Query:** The repeat step located below the `UNION`. It refers back to the CTE name and keeps generating new rows until it finds 0 rows.
+
+### How PostgreSQL Runs It: The Two Secret Tables
+
+When PostgreSQL executes a recursive CTE, you don't have to worry about complex recursion stacks. Behind the scenes, Postgres simply creates **two temporary secret tables**:
+
+1. **The Results Table (The Storage Box):** This table holds _everything_ collected so far. Every time a new round finishes, its rows get added here.
+2. **The Working Table (The Current Batch):** This table only holds the rows from the _very last round_. The repeat query reads directly from this table.
+
+```mermaid
+flowchart TD
+    Start(["Start"]) --> Step1["Create Results Table and Working Table in memory"]
+    Step1 --> Step2["Run Initial Query (the starting rows)"]
+    Step2 --> Step3["Put initial rows into both Results Table and Working Table"]
+
+    Step3 --> Check{"Did Working Table<br/>get any rows?"}
+    Check -- "No" --> Done(["Stop Recursion!<br/>Send Results Table to your final SELECT"])
+
+    Check -- "Yes" --> Step4["Run Recursive Query<br/>(Reads data from Working Table)"]
+    Step4 --> CheckNew{"Did this round<br/>find any new rows?"}
+
+    CheckNew -- "No (0 rows left)" --> Done
+    CheckNew -- "Yes" --> Step5["1. Append new rows to Results Table<br/>2. Empty out the old Working Table<br/>3. Put the new rows into Working Table"]
+    Step5 --> Step4
+```
+
+#### The Golden Rule to Remember
+
+Whenever you see the CTE name inside the recursive query (e.g., `FROM countdown`), **mentally read it as `FROM working_table`**. It only looks at the batch from the last step, not everything that came before!
+
+### Your First Example: The Countdown Query
+
+The simplest way to see this loop in action is to count down numbers from 3 to 1.
+
+#### The SQL Code
+
+```sql
+-- Create a recursive CTE called 'countdown' with one column named 'val'
+WITH RECURSIVE countdown(val) AS (
+    -- 1. Initial Query: Start our counter at 3
+    SELECT 3 AS val
+
+    UNION
+
+    -- 2. Recursive Query: Take the current number in the working table and subtract 1
+    SELECT val - 1
+    FROM countdown
+    WHERE val > 1 -- Stopping Rule: Stop once val drops to 1
+)
+-- 3. Outer Query: Show the whole collected list
+SELECT val
+FROM countdown;
+```
+
+#### What Happens Step by Step
+
+```text
++-----------+-------------------------+-------------------------+-----------------------------+
+| Round     | Working Table (Input)   | What Recursive Query Does| Results Table (Accumulator) |
++-----------+-------------------------+-------------------------+-----------------------------+
+| Start     | [ 3 ]                   | Runs initial query      | [ 3 ]                       |
+| Round 1   | [ 3 ]                   | 3 - 1 = [ 2 ]           | [ 3, 2 ]                    |
+| Round 2   | [ 2 ]                   | 2 - 1 = [ 1 ]           | [ 3, 2, 1 ]                 |
+| Round 3   | [ 1 ]                   | 1 > 1 is False (0 rows) | [ 3, 2, 1 ] -> Finished!    |
++-----------+-------------------------+-------------------------+-----------------------------+
+```
+
+#### Expected Output
+
+```text
+ val
+-----
+   3
+   2
+   1
+(3 rows)
+```
+
+> [!TIP]
+> If you change `SELECT 3 AS val` to `SELECT 10 AS val`, it counts down from 10 to 1. If you forget the `WHERE val > 1` clause, the query will count down into negative numbers forever until your database runs out of memory or cancels the query!
+
+### Why Do We Need This? Trees, Hierarchies, and Friends-of-Friends
+
+Why would anyone need a loop in SQL? Couldn't we just use regular `JOIN` statements?
+
+Imagine you run an app like Instagram, and you want to build a **"Who to Follow"** suggestion box:
+
+```text
++-----------------------------------------------------------------------------+
+|                     HOW INSTAGRAM SUGGESTIONS WORK                          |
+|                                                                             |
+|      [ You: Haley ]                                                         |
+|           |                                                                 |
+|           +-----------------------+                                         |
+|           |                       |                                         |
+|      ( The Rock )           ( Kevin Hart )      <- Level 1: People you follow|
+|           |                       |                                         |
+|           |                       +--------------------+                    |
+|           |                       |                    |                    |
+|    ( Justin Bieber )      ( Jennifer Lopez )     ( Snoop Dogg )             |
+|           |                       |                    |                    |
+|           +-----------------------+--------------------+                    |
+|                                   |                                         |
+|                      Level 2: Friends of friends                            |
+|                 (These are your follow suggestions!)                        |
++-----------------------------------------------------------------------------+
+```
+
+#### The Problem with Regular `JOIN`s
+
+- To find who **Haley** follows: 1 simple `SELECT`.
+- To find who **they** follow (2nd degree): 1 `JOIN`.
+- What if Haley scrolls down and exhausts all suggestions? To find who _those_ people follow (3rd degree): you have to write a second `JOIN`.
+- What if you need to go 4 or 5 levels deep? Your SQL query becomes a giant, messy mountain of hard-coded joins!
+
+Even worse, you have to know in advance exactly how many levels deep you want to go. If your data is an organizational chart (CEO $\rightarrow$ VP $\rightarrow$ Manager $\rightarrow$ Employee) or a category list with arbitrary subcategories, you don't know the depth beforehand.
+
+**A recursive CTE solves this by doing the next join automatically, level by level, until it reaches the end or your chosen limit.**
+
+### Real-World Project: Building Instagram Follow Suggestions
+
+Let's write a real query to generate follow suggestions for a user.
+
+#### The Tables We Are Working With
+
+1. **`users` table:** has `id` and `username`.
+2. **`followers` table:** has `leader_id` (the person being followed) and `follower_id` (the person doing the following).
+
+#### The SQL Query
+
+```sql
+-- Search through the network for user 1000's suggestions
+WITH RECURSIVE suggestions(leader_id, follower_id, depth) AS (
+    -- 1. Initial Query: Find everyone that user 1000 directly follows
+    SELECT
+        leader_id,
+        follower_id,
+        1 AS depth -- We start at depth level 1
+    FROM followers
+    WHERE follower_id = 1000
+
+    UNION
+
+    -- 2. Recursive Query: Find who those leaders are following
+    SELECT
+        followers.leader_id,
+        followers.follower_id,
+        suggestions.depth + 1 -- Move to the next level (depth 2, depth 3, etc.)
+    FROM followers
+    JOIN suggestions ON suggestions.leader_id = followers.follower_id
+    WHERE suggestions.depth < 3 -- Safety limit: Don't go deeper than level 2
+)
+-- 3. Outer Query: Show usernames, but hide direct follows
+SELECT DISTINCT
+    users.id,
+    users.username
+FROM suggestions
+JOIN users ON users.id = suggestions.leader_id
+WHERE suggestions.depth > 1 -- Don't suggest people user 1000 already follows!
+LIMIT 30; -- Only show up to 30 suggestions
+```
+
+#### Key Things to Notice in This Query
+
+- **`1 AS depth` and `depth + 1`:** Flat database tables don't store "levels". We create our own helper counter called `depth` so we can track how far away a person is from our starting user.
+- **`WHERE suggestions.depth < 3`:** This stops our loop after finding 2nd-degree connections. Without this, on a real social network with millions of accounts, the query would explode in size.
+- **`WHERE suggestions.depth > 1`:** Depth 1 are the people user 1000 already follows directly (e.g., The Rock and Kevin Hart). We filter them out so we only suggest _new_ people.
+- **`SELECT DISTINCT`:** If both The Rock and Kevin Hart follow the same person, `DISTINCT` makes sure that person is only suggested once.
+
+### Step-by-Step Walkthrough: What Happens Behind the Scenes
+
+Let's trace this query with a tiny example dataset where **Haley (`id = 1`)** is our starting user.
+
+#### The Small Test Dataset
+
+- **Haley (1)** follows **The Rock (5)** and **Kevin Hart (4)**.
+- **The Rock (5)** follows **Justin Bieber (6)**.
+- **Kevin Hart (4)** follows **Jennifer Lopez (2)** and **Snoop Dogg (3)**.
+
+```text
++-----------------------------------------------------------------------------------------+
+|                              HOW POSTGRES EXECUTES THIS                                 |
+|                                                                                         |
+|  [STEP 1: INITIAL QUERY]                                                                |
+|  Find all rows where follower_id = 1 (Haley):                                           |
+|  - The Rock (leader: 5, depth: 1)                                                       |
+|  - Kevin Hart (leader: 4, depth: 1)                                                     |
+|  -> Copied into both the Results Table and Working Table.                               |
+|                                                                                         |
+|  [STEP 2: ROUND 1 (RECURSIVE QUERY)]                                                    |
+|  Postgres checks: Who do leaders 5 and 4 follow?                                        |
+|  - Leader 5 (The Rock) follows Leader 6 (Justin Bieber)       -> New row: (6, depth: 2) |
+|  - Leader 4 (Kevin Hart) follows Leader 2 (J. Lo) & 3 (Snoop) -> New rows: (2, depth: 2)|
+|                                                                      (3, depth: 2)      |
+|  Are these depths < 2? Yes! (depth was 1).                                              |
+|  -> Added to Results Table.                                                             |
+|  -> Old Working Table is cleared; replaced with [6, 2, 3].                              |
+|                                                                                         |
+|  [STEP 3: ROUND 2 (RECURSIVE QUERY)]                                                    |
+|  Postgres looks at the Working Table: Who do 6, 2, and 3 follow?                        |
+|  The current rows have depth = 2.                                                       |
+|  The rule says WHERE depth < 2.                                                         |
+|  Since 2 is not less than 2, the check fails -> 0 rows returned!                        |
+|  -> Working Table is empty. The loop immediately stops!                                 |
+|                                                                                         |
+|  [STEP 4: FINAL CLEANUP (OUTER QUERY)]                                                  |
+|  1. Filter out depth = 1 (removes The Rock and Kevin Hart).                             |
+|  2. Match remaining IDs [6, 2, 3] against the users table.                             |
+|  3. Output: Justin Bieber, Jennifer Lopez, Snoop Dogg!                                  |
++-----------------------------------------------------------------------------------------+
+```
+
+#### Final Output
+
+```text
+ id |   username
+----+----------------
+  2 | jennifer_lopez
+  3 | snoop_dogg
+  6 | justin_bieber
+(3 rows)
+```
+
+### Quick Comparison & Safety Tips
+
+#### When to Use What
+
+| Technique                        | When to Use It                                                                       | Pros                                                                     | Cons / Watch Out                                                  |
+| :------------------------------- | :----------------------------------------------------------------------------------- | :----------------------------------------------------------------------- | :---------------------------------------------------------------- |
+| **Simple `JOIN`**                | You know the exact depth (e.g., direct friends or 1 level of categories).            | Very fast and easy to read.                                              | Cannot handle unknown or dynamic depths.                          |
+| **Recursive CTE**                | You have hierarchical data (org charts, tree folders, networks, friends-of-friends). | Runs entirely in the database; handles any number of levels dynamically. | Can cause infinite loops if you forget a stopping condition.      |
+| **Application Loop (Python/JS)** | Doing a query inside a code loop (`for` / `while`).                                  | Familiar to general programmers.                                         | Very slow! Requires dozens of network roundtrips to the database. |
+
+> [!CAUTION]
+> **The Infinite Loop Trap:** In social networks, people follow each other in circles (User A follows User B, and User B follows User A). If you do not include a depth limit (like `WHERE depth < 3`), your query will loop back and forth between them forever! Always include a depth limit or an explicit stopping rule.
+
+### Knowledge Check
+
+<details>
+<summary><b>Question 1: In plain English, what is the main purpose of a Recursive CTE?</b></summary>
+<br>
+<b>Answer:</b> It allows you to run a loop directly inside SQL to walk through hierarchical or tree-like data (such as org charts, category trees, or social network connections) without having to write multiple hard-coded JOIN statements.
+</details>
+
+<details>
+<summary><b>Question 2: What is the difference between the Results Table and the Working Table during execution?</b></summary>
+<br>
+<b>Answer:</b> The Results Table accumulates all the rows found across every round from start to finish. The Working Table is a temporary scratchpad that only holds the rows from the single most recent round so the recursive query knows what to process next.
+</details>
+
+<details>
+<summary><b>Question 3: Why did we add a helper column like `1 AS depth` to our Instagram query?</b></summary>
+<br>
+<b>Answer:</b> Because the raw database tables don't keep track of how many levels away a user is. Adding a depth counter lets us stop the recursion at a safe level (like `WHERE depth < 3`) and filter out direct friends in the final output (with `WHERE depth > 1`).
+</details>
+
+<details>
+<summary><b>Question 4: What tells PostgreSQL that it is time to stop the recursion?</b></summary>
+<br>
+<b>Answer:</b> PostgreSQL automatically stops the loop when the recursive query produces 0 rows (an empty result). Once that happens, it sends the full Results Table to the outer query.
 </details>
