@@ -98,7 +98,7 @@
    * [Advanced Query Tuning](#advanced-query-tuning)
    * [Recursive Common Table Expressions (CTEs)](#recursive-common-table-expressions-ctes)
    * [Simplifying Queries with Views](#simplifying-queries-with-views)
-   * [Materialized Views](#materialized-views)
+   * [Materialized Views and Query Caching](#materialized-views-and-query-caching)
 
 
 <!-- TOC end -->
@@ -6200,130 +6200,105 @@ Test your understanding of PostgreSQL views with these review questions:
 <b>Answer:</b> Absolutely nothing happens to the data. A view is simply a stored query definition in the database catalog with no physical data of its own. Dropping the view deletes the virtual wrapper, while the underlying physical table and its rows remain 100% intact.
 </details>
 
-## Materialized Views
+## Materialized Views and Query Caching
 
 ### Conceptual Overview: Standard Views vs. Materialized Views
 
-In relational databases like PostgreSQL, queries often grow complex and computationally expensive as data volume expands. When building dashboards, reporting services, or analytics endpoints, repeatedly calculating aggregates across multiple joined tables introduces heavy latency and wastes database CPU cycles.
+In PostgreSQL, a **View** is essentially a query that we package up so we can refer back to it in the future. However, whenever we query a standard view, PostgreSQL executes the underlying query stored inside it every single time.
 
-To organize and reuse SQL logic, developers typically reach for **Views**. However, standard views and **Materialized Views** serve fundamentally different architectural purposes:
+A **Materialized View** is a variation on a view that solves the problem of expensive queries:
 
-- **Standard View:** A stored query definition acting as a virtual table. It stores **no physical data on disk**. Whenever an application queries a standard view, PostgreSQL executes the underlying query on the fly. It is purely syntactic sugar that simplifies query readability and access control.
-- **Materialized View:** A stored query definition whose result set is **physically executed and persisted onto disk** like a concrete table. Subsequent reads hit the precomputed data directly without touching the underlying source tables or re-evaluating joins and aggregations.
+- It packages an underlying query, but executes it only at specific times.
+- PostgreSQL takes the query results, saves them on disk, and lets us refer back to those saved results without rerunning the query.
+- It is designed for expensive queries that take multiple seconds, minutes, or even hours to run.
 
 ```text
-STANDARD VIEW (Virtual / On-the-Fly Query):
-Client Query ──> [ Standard View ] ──> Executes Underlying Query ──> Scans Base Tables ──> Returns Result
-(Every request re-runs the full query from scratch; heavy CPU and I/O cost)
+STANDARD VIEW (Virtual Query):
+Client Query ──> [ View Definition ] ──> Re-runs Query ──> Base Tables ──> Results
+(Re-executes the query on every request; heavy runtime on large tables)
 
-MATERIALIZED VIEW (Persisted / Precomputed Cache):
+MATERIALIZED VIEW (Saved Result Set):
 1. Creation / Refresh:
-   Underlying Query ──> Scans Base Tables ──> Computes Aggregates ──> Writes Cache to Disk
+   Underlying Query ──> Scans Base Tables ──> Saves Results to Disk
 
 2. Client Query:
-   Client Query ──> [ Materialized View Table on Disk ] ──> Returns Precomputed Result
-   (Fast linear read from disk cache; runs in single-digit milliseconds)
+   Client Query ──> [ Saved Results on Disk ] ──> Results
+   (Reads precomputed results directly; runs in milliseconds without re-running the query)
 ```
 
 ```mermaid
 flowchart TD
-    subgraph StandardView["Standard View Execution Flow"]
-        ClientA["Application Client"] -->|"SELECT * FROM my_view"| ViewEngine["Standard View Definition"]
-        ViewEngine -->|"Executes on every call"| HeavyJoin["Multi-Table Join & Aggregation"]
-        HeavyJoin -->|"Full Table Scans"| DiskA[("Postgres Base Tables")]
-        DiskA --> ViewEngine
-        ViewEngine --> ClientA
+    subgraph StandardView["Standard View"]
+        Q1["Client runs SELECT"] --> V1["View Definition"]
+        V1 -->|"Re-runs query every time"| T1["Base Tables: likes, posts, comments"]
+        T1 -->|"Takes 2 to 30 seconds"| V1
+        V1 --> R1["Return Result to Client"]
     end
 
-    subgraph MaterializedView["Materialized View Execution Flow"]
-        ClientB["Application Client"] -->|"SELECT * FROM my_mat_view"| MatCache[("Persisted Materialized Cache on Disk")]
-        MatCache -->|"Instant Read (Milliseconds)"| ClientB
-        CronWorker["Background Worker / Cron"] -->|"REFRESH MATERIALIZED VIEW"| Recalc["Re-run Heavy Query Engine"]
-        Recalc -->|"Background Batch Read"| DiskB[("Postgres Base Tables")]
-        DiskB --> Recalc
-        Recalc -->|"Overwrites Cache"| MatCache
+    subgraph MaterializedView["Materialized View"]
+        Create["CREATE MATERIALIZED VIEW ... WITH DATA"] -->|"Run query once"| T2["Base Tables: likes, posts, comments"]
+        T2 -->|"Save result set to disk"| Store["Persisted Storage: weekly_likes"]
+        Q2["Client runs SELECT"] --> Store
+        Store -->|"Returns saved data in ~50ms"| R2["Return Result to Client"]
+        Refresh["REFRESH MATERIALIZED VIEW"] -->|"Re-run query when needed"| T2
+        T2 -->|"Update saved data"| Store
     end
 ```
 
 > [!NOTE]
-> **The Common Table Expression (CTE) Parallel:**
-> An intuitive way to understand this distinction is comparing types of CTEs. A **Simple CTE** (`WITH ... AS (...)`) provides syntactic sugar to make complex queries readable—just like a **Standard View**. In contrast, tools like **Recursive CTEs** or **Materialized Views** provide distinct runtime capabilities (recursive graph traversal or persistent disk caching) that solve performance and structural problems impossible to solve with syntactic sugar alone.
+> **Parallel with Common Table Expressions (CTEs):**
+> There is a direct parallel here to the world of CTEs:
+>
+> - **Simple CTEs and Standard Views** are convenience tools that make queries easier to read and organize.
+> - **Recursive CTEs and Materialized Views** add major functionality that allows us to perform operations we otherwise could not do.
 
 ### The Analytical Problem: Aggregating Weekly Engagement Across Posts and Comments
 
-Consider a social network database containing three core tables: `posts`, `comments`, and `likes`.
+Consider an application with three tables: `posts`, `comments`, and `likes`.
 
-In this domain model, users can like either a post or a comment. As a result, the `likes` table uses polymorphic foreign keys:
+In this schema, users can like either a post or a comment:
 
-- If a like belongs to a post: `post_id` contains an integer ID, and `comment_id` is `NULL`.
-- If a like belongs to a comment: `comment_id` contains an integer ID, and `post_id` is `NULL`.
+- A like for a post has `post_id` populated, and `comment_id` is `NULL`.
+- A like for a comment has `comment_id` populated, and `post_id` is `NULL`.
 
-```text
-                     +---------------------------+
-                     |           likes           |
-                     +---------------------------+
-                     | id         : integer      |
-                     | created_at : timestamp    |
-                     | user_id    : integer      |
-                     | post_id    : integer NULL |
-                     | comment_id : integer NULL |
-                     +---------------------------+
-                               /       \
-         (If post_id IS NOT NULL)     (If comment_id IS NOT NULL)
-                             /           \
-                            v             v
-             +--------------------+    +--------------------+
-             |       posts        |    |      comments      |
-             +--------------------+    +--------------------+
-             | id         : int   |    | id         : int   |
-             | created_at : time  |    | created_at : time  |
-             | url        : text  |    | contents   : text  |
-             +--------------------+    +--------------------+
-```
+#### Goal of the Query
 
-#### The Business Requirement
+1. Show every sequential week of the application, starting from the date of the very first post up to the last post.
+2. Assign each post and comment to the **week it was created**.
+3. For each week, count the **number of likes that posts received** and the **number of likes that comments received**.
 
-We need an analytics report that:
-
-1. Tracks activity starting from the week of the very first post through the most recent week.
-2. Assigns each post and comment to the **week it was created**.
-3. Computes the **total number of likes** received by posts created in that week, alongside the **total number of likes** received by comments created in that week.
-
-Notice that likes are attributed to the creation week of the content (post or comment), rather than the timestamp when the like button was pressed.
+Notice that likes are grouped by when the _post or comment was created_, not when the like itself was added.
 
 ```text
-Week 1 (2010-01-01 to 2010-01-07)          Week 2 (2010-01-08 to 2010-01-14)
+Timeline:
+2010-01-01 (Week 1)                        2010-01-08 (Week 2)
 ├──────────────────────────────────────────┼──────────────────────────────────────────┤
-│ Content Created:                         │ Content Created:                         │
-│  - Post #1                               │  - Comment #2                            │
-│  - Post #2                               │  - Comment #3                            │
-│  - Comment #1                            │                                          │
+│ Content created this week:               │ Content created this week:               │
+│  - Posts: Post 1, Post 2                 │  - Posts: None                           │
+│  - Comments: Comment 1                   │  - Comments: Comment 2, Comment 3        │
 │                                          │                                          │
-│ Likes Received (whenever received):      │ Likes Received (whenever received):      │
-│  - Post #2 receives 3 likes              │  - Comment #2 receives 1 like            │
-│  - Comment #1 receives 1 like            │  - Comment #3 receives 1 like            │
+│ Likes assigned to this content:          │ Likes assigned to this content:          │
+│  - Post 2 receives 3 likes               │  - Comment 2 receives 1 like             │
+│  - Comment 1 receives 1 like             │  - Comment 3 receives 1 like             │
 │                                          │                                          │
-│ Aggregated Output:                       │ Aggregated Output:                       │
-│  Likes on Posts: 3                       │  Likes on Posts: 0                       │
-│  Likes on Comments: 1                    │  Likes on Comments: 2                    │
+│ Tabulated Output:                        │ Tabulated Output:                        │
+│  week: 2010-01-01                        │  week: 2010-01-08                        │
+│  likes_for_posts: 3                      │  likes_for_posts: 0                      │
+│  likes_for_comments: 1                   │  likes_for_comments: 2                   │
 ```
 
-### Preserving Disjoint Relationships with Multi-Table LEFT JOINs
+### Preserving Disjoint Records with Multi-Table LEFT JOINs
 
-To aggregate likes for both posts and comments in a single query, we must join `likes` to both `posts` and `comments`.
+To combine likes, posts, and comments into a single dataset, we must perform a three-way join starting from `likes`.
 
-#### The Inner Join Trap
+#### The Inner Join Pitfall
 
-Beginner software engineers often write `JOIN` by default. In SQL, an unqualified `JOIN` keyword is an `INNER JOIN`.
+By default, writing `JOIN` implies an `INNER JOIN`. An inner join only retains rows that find matching records across all joined tables.
 
-If we join `likes` to `posts` and then join to `comments` using inner joins:
-
-- Every row in `likes` has either `post_id = NULL` or `comment_id = NULL`.
-- An inner join demands that the condition matches in **both** joined tables simultaneously.
-- Because no single row in `likes` has both a valid `post_id` and a valid `comment_id`, an inner join evaluates to `false` for every single row.
+Because every row in `likes` has either `post_id` as `NULL` or `comment_id` as `NULL`, no single row matches both `posts` and `comments` at the same time:
 
 ```sql
--- TRAP: Inner Join returns 0 records!
+-- PITFALL: Running an inner join produces an empty result set!
 SELECT *
 FROM likes
 JOIN posts ON posts.id = likes.post_id
@@ -6335,29 +6310,28 @@ Expected Output:
 (0 rows)
 ```
 
-> [!CAUTION]
-> If a multi-table join in your application unexpectedly returns zero records, inspect your join types. An `INNER JOIN` discards any row that fails to find a matching partner in every joined table.
+If an analytical query returns completely empty results, check the join type. An inner join drops rows whenever an association is absent.
 
-#### Why LEFT JOIN Is Mandatory
+#### Why We Use LEFT JOIN
 
-A `LEFT JOIN` (or `LEFT OUTER JOIN`) preserves all records from the left-hand table (`likes`), even when no match exists in the right-hand table (`posts` or `comments`). Unmatched columns are automatically populated with `NULL`.
+A `LEFT JOIN` ensures all rows from the left-hand table (`likes`) are retained. If there is no corresponding row in `posts` or `comments`, PostgreSQL fills those columns with `NULL`:
 
 ```text
-LIKES TABLE              POSTS TABLE (LEFT JOIN)         COMMENTS TABLE (LEFT JOIN)
-id | post_id | com_id    post.id | post.created_at       com.id | com.created_at
----+---------+--------   --------+-----------------      -------+-----------------
- 1 |    2    |  NULL  ─>    2    | 2010-01-03 ...    ─>   NULL  | NULL
- 2 |   NULL  |   3    ─>   NULL  | NULL              ─>     3   | 2010-01-10 ...
- 3 |   NULL  |   2    ─>   NULL  | NULL              ─>     2   | 2010-01-09 ...
- 4 |    2    |  NULL  ─>    2    | 2010-01-03 ...    ─>   NULL  | NULL
- 5 |    2    |  NULL  ─>    2    | 2010-01-03 ...    ─>   NULL  | NULL
- 6 |   NULL  |   1    ─>   NULL  | NULL              ─>     1   | 2010-01-05 ...
+likes table:
++----+---------+------------+
+| id | post_id | comment_id |
++----+---------+------------+
+| 1  | 2       | NULL       | ──> Matches post 2       ──> comment columns are NULL
+| 2  | NULL    | 3          | ──> post columns are NULL ──> Matches comment 3
+| 3  | NULL    | 2          | ──> post columns are NULL ──> Matches comment 2
+| 4  | 2       | NULL       | ──> Matches post 2       ──> comment columns are NULL
+| 5  | 2       | NULL       | ──> Matches post 2       ──> comment columns are NULL
+| 6  | NULL    | 1          | ──> post columns are NULL ──> Matches comment 1
++----+---------+------------+
 ```
 
-By chaining two `LEFT JOIN` operations from `likes`, every row retains its like identity while attaching metadata from whichever parent entity exists:
-
 ```sql
--- Preserves all like records, pairing with either post data or comment data
+-- Three-way LEFT JOIN preserves all likes
 SELECT *
 FROM likes
 LEFT JOIN posts ON posts.id = likes.post_id
@@ -6366,43 +6340,39 @@ LEFT JOIN comments ON comments.id = likes.comment_id;
 
 ```text
 Expected Output (Sample Rows):
- id |     created_at      | user_id | post_id | comment_id | id |     created_at      |   url   | user_id | id |     created_at      | contents | user_id | post_id
+ id |     created_at      | user_id | post_id | comment_id | id |     created_at      | url     | user_id | id |     created_at      | contents | user_id | post_id
 ----+---------------------+---------+---------+------------+----+---------------------+---------+---------+----+---------------------+----------+---------+---------
   1 | 2010-02-15 08:12:00 |      14 |       2 |            |  2 | 2010-01-11 14:22:00 | img.jpg |       5 |    |                     |          |         |
   2 | 2010-02-18 10:45:00 |       8 |         |          3 |    |                     |         |         |  3 | 2010-01-18 09:15:00 | nice!    |      12 |       1
   3 | 2010-02-19 12:00:00 |      21 |         |          2 |    |                     |         |         |  2 | 2010-01-18 11:30:00 | cool pic |       4 |       1
-  4 | 2010-02-20 16:30:00 |       3 |       2 |            |  2 | 2010-01-11 14:22:00 | img.jpg |       5 |    |                     |          |         |
-(4 rows shown)
+(3 rows shown)
 ```
 
 ### Time-Bucket Aggregations: Using date_trunc and COALESCE
 
-Now that every like row is joined with its corresponding parent item, we need to group these interactions into discrete calendar weeks based on the parent item's creation timestamp.
+After joining, each row has a timestamp from either `posts.created_at` or `comments.created_at`. We must extract that timestamp and bucket it into calendar weeks.
 
-#### Fallback Selection with COALESCE
+#### Handling NULLs with COALESCE
 
-Because each row has either a `posts.created_at` timestamp or a `comments.created_at` timestamp (the other being `NULL`), we need a single consolidated column containing the valid timestamp.
-
-The SQL `COALESCE(...)` function scans its arguments from left to right and returns the first non-null value:
-
-$$\text{COALESCE}(\text{posts.created\_at}, \text{comments.created\_at})$$
-
-```text
-Row 1: posts.created_at = '2010-01-11', comments.created_at = NULL        ──> Evaluates to: '2010-01-11'
-Row 2: posts.created_at = NULL,        comments.created_at = '2010-01-18' ──> Evaluates to: '2010-01-18'
-```
-
-> [!TIP]
-> Think of `COALESCE(a, b)` like the JavaScript nullish coalescing operator (`a ?? b`) or Python fallback expression (`a if a is not None else b`). It ensures our date calculations never run on a `NULL` input.
-
-#### Flooring Timestamps with date_trunc
-
-Database timestamps contain granular precision (hours, minutes, seconds, milliseconds). If you attempt to `GROUP BY` a raw timestamp, rows from the same day or week will not group together because their seconds and hours differ.
-
-The PostgreSQL `date_trunc(unit, timestamp)` function truncates a timestamp to the beginning of the specified interval. When passed `'week'`, it resets the time components to zero and floors the date to the Monday midnight of that week:
+Since one of the two `created_at` values is always `NULL`, we pass them into `COALESCE`:
 
 ```sql
--- Rounds the creation timestamp down to Monday 00:00:00 of that week
+COALESCE(posts.created_at, comments.created_at)
+```
+
+`COALESCE` takes a list of arguments and returns the first argument that is not `NULL`. If `posts.created_at` is defined, it uses that; otherwise, it falls back to `comments.created_at`.
+
+#### Rounding Down with date_trunc
+
+To group timestamps into weeks, we use PostgreSQL's built-in `date_trunc` function:
+
+```sql
+date_trunc('week', COALESCE(posts.created_at, comments.created_at)) AS week
+```
+
+`date_trunc` extracts a specific interval from a timestamp and automatically rounds it down to the beginning of that unit. Passing `'week'` rounds the timestamp down to the start of that week (Monday at 00:00:00).
+
+```sql
 SELECT
     date_trunc('week', COALESCE(posts.created_at, comments.created_at)) AS week
 FROM likes
@@ -6418,23 +6388,22 @@ Expected Output:
  2010-01-11 00:00:00+00
  2010-01-11 00:00:00+00
  2010-01-18 00:00:00+00
- 2010-01-18 00:00:00+00
  2010-01-25 00:00:00+00
-(5 rows shown)
+(4 rows shown)
 ```
 
-### Constructing and Benchmarking the Heavy Analytical Query
+### Constructing the Full Analytical Query
 
-To produce the final weekly metrics, we apply `GROUP BY week` and count the interactions for posts and comments separately.
+Next, we add `GROUP BY week` and count the likes for posts and comments.
 
-#### The Counting Mechanic: COUNT(column) vs. COUNT(\*)
+#### How COUNT Ignores NULL Values
 
-A critical beginner gotcha in SQL aggregation:
+In SQL, `COUNT(column_name)` counts only non-null values:
 
-- `COUNT(*)` counts all rows in the group, regardless of whether column values are null.
-- `COUNT(column_name)` counts only rows where `column_name` **is NOT NULL**.
+- `COUNT(posts.id)` counts rows where a post was liked (ignoring rows where `posts.id` is `NULL`).
+- `COUNT(comments.id)` counts rows where a comment was liked (ignoring rows where `comments.id` is `NULL`).
 
-Since each joined row contains `posts.id` (if the like was for a post) or `NULL` (if the like was for a comment), running `COUNT(posts.id)` counts only the likes that belong to posts. Conversely, `COUNT(comments.id)` counts only the likes that belong to comments.
+We alias these columns as `likes_for_posts` and `likes_for_comments` to clearly describe the metric:
 
 ```sql
 SELECT
@@ -6459,23 +6428,19 @@ Expected Output:
 (4 rows shown)
 ```
 
-#### The Performance Bottleneck
+#### Why This Query Is Slow
 
-While this query produces accurate business metrics, it is computationally expensive:
+This query scans multiple large tables, evaluates joins and date functions on every row, and performs group-by aggregations.
 
-1. It performs a multi-table scan across thousands or millions of likes, posts, and comments.
-2. It evaluates string and date calculations (`COALESCE`, `date_trunc`) on every single joined row.
-3. It performs an in-memory or on-disk hash aggregation and sorting step.
-
-On production-scale datasets, this query can take anywhere from **2 to 30+ seconds** to complete. Executing this query on every incoming HTTP request to an analytics dashboard will exhaust database connection pools, spike CPU utilization, and cause API timeouts.
+On modern computers, this query takes **2 to 3 seconds** to run; on older hardware or larger datasets, it can easily take **10 to 30 seconds**. Running a query this slow repeatedly would place an unacceptable load on the database.
 
 ### Creating and Querying the Materialized View
 
-Because past weekly engagement numbers rarely change retroactively, running this multi-second calculation repeatedly is unnecessary. Instead, we persist the result set into a **Materialized View**.
+To avoid rerunning this expensive query every time, we save its output in a materialized view.
 
-#### Syntax and Creation
+#### Syntax: CREATE MATERIALIZED VIEW
 
-To create a materialized view, wrap the query in `CREATE MATERIALIZED VIEW [view_name] AS (...)` followed by the `WITH DATA` clause:
+Wrap the query inside parentheses, name the view `weekly_likes`, and append `WITH DATA`:
 
 ```sql
 CREATE MATERIALIZED VIEW weekly_likes AS (
@@ -6499,16 +6464,15 @@ Query returned successfully in 2.84 secs.
 
 > [!IMPORTANT]
 >
-> - **The `WITH DATA` Clause:** Tells PostgreSQL to execute the query immediately during creation and populate the physical storage. If you omit this or specify `WITH NO DATA`, the view is created in an unqueryable state until a manual refresh is triggered.
-> - **Semicolon Placement:** Place the terminating semicolon `;` at the very end of the statement (after `WITH DATA`), never inside the query parentheses.
+> - **`WITH DATA`:** Instructs PostgreSQL to immediately execute the query one time and save the results when creating the materialized view.
+> - **Semicolon Placement:** Place the semicolon outside the closing parenthesis, not inside.
 
-#### Querying the Precomputed Cache
+#### Querying the Saved Results
 
-Once created, you can query `weekly_likes` exactly as if it were a standard PostgreSQL table. You can filter with `WHERE`, paginate with `LIMIT`/`OFFSET`, or order by columns:
+We can now query `weekly_likes` just like a regular table:
 
 ```sql
-SELECT *
-FROM weekly_likes;
+SELECT * FROM weekly_likes;
 ```
 
 ```text
@@ -6519,21 +6483,20 @@ Expected Output:
  2010-01-18 00:00:00+00 |              31 |                  3
  2010-01-25 00:00:00+00 |              45 |                 12
  2010-02-01 00:00:00+00 |              50 |                 19
-Query returned successfully in 42 ms.
+Query returned successfully in 59 ms.
 ```
 
-**Latency Reduction:** Query execution drops from **~2,800 ms down to ~40 ms** (a ~70x speedup), as the database reads pre-aggregated records straight from disk cache rather than scanning millions of raw rows.
+Execution speed drops from **2 to 3 seconds down to 59 milliseconds** because PostgreSQL reads precomputed results directly from disk without re-executing the heavy query. We can also filter, sort, or select specific columns from it freely.
 
-### Cache Synchronization: Handling Stale Data with REFRESH
+### Managing Data Staleness and Refreshing
 
-The primary architectural trade-off of a materialized view is **data staleness**. A materialized view does **not** automatically update when records in the underlying tables are inserted, updated, or deleted.
+The primary trade-off of a materialized view is that it does **not** automatically update when the underlying data changes.
 
-#### Demonstrating Cache Invalidation
+#### Demonstrating Stale Data
 
-Suppose we delete all posts created during the first month (January 2010):
+If we delete all posts created during January 2010:
 
 ```sql
--- Delete underlying posts created before February 1st, 2010
 DELETE FROM posts
 WHERE created_at < '2010-02-01';
 ```
@@ -6543,29 +6506,27 @@ Expected Output:
 DELETE 60
 ```
 
-If we immediately query `weekly_likes` again, the January rows still appear with their original post like counts:
+When we query `weekly_likes` again, the January weeks and like counts still appear:
 
 ```sql
 SELECT * FROM weekly_likes;
 ```
 
 ```text
-Expected Output (Stale Cache!):
+Expected Output (Stale Results):
           week          | likes_for_posts | likes_for_comments
 ------------------------+-----------------+--------------------
  2010-01-11 00:00:00+00 |              29 |                  0
  2010-01-18 00:00:00+00 |              31 |                  3
- 2010-01-25 00:00:00+00 |              45 |                 12
 ```
 
-The database returned stale data because PostgreSQL holds onto the snapshot generated when the view was materialized.
+Because the underlying data changed, PostgreSQL is now returning saved results that are out of date.
 
-#### Refreshing the Materialized View
+#### Updating with REFRESH MATERIALIZED VIEW
 
-To synchronize the materialized view with current table state, instruct PostgreSQL to re-run the underlying query and overwrite the stored cache using `REFRESH MATERIALIZED VIEW`:
+To update the saved results, we tell PostgreSQL to rerun the underlying query and save the new output:
 
 ```sql
--- Re-runs the query and updates the stored disk cache
 REFRESH MATERIALIZED VIEW weekly_likes;
 ```
 
@@ -6575,14 +6536,14 @@ REFRESH MATERIALIZED VIEW
 Query returned successfully in 2.15 secs.
 ```
 
-Now, querying `weekly_likes` reflects the updated reality (all January rows where posts were deleted are adjusted or removed):
+Now, querying `weekly_likes` returns the updated data without the deleted January records:
 
 ```sql
 SELECT * FROM weekly_likes;
 ```
 
 ```text
-Expected Output (Fresh Cache):
+Expected Output (Updated Results):
           week          | likes_for_posts | likes_for_comments
 ------------------------+-----------------+--------------------
  2010-02-01 00:00:00+00 |              50 |                 19
@@ -6592,48 +6553,53 @@ Expected Output (Fresh Cache):
 ```mermaid
 sequenceDiagram
     autonumber
-    actor Client as Web Application / API
-    participant MV as Materialized View (Disk)
-    participant Worker as Scheduled Job (Cron / Celery)
-    participant Engine as PostgreSQL Query Engine
-    participant Tables as Base Tables (posts, likes)
+    participant App as Application
+    participant MV as Materialized View (weekly_likes)
+    participant DB as Postgres Base Tables
 
-    Client->>MV: SELECT * FROM weekly_likes
-    MV-->>Client: Returns cached data (< 50ms)
+    Note over App,DB: Initial Creation
+    App->>DB: CREATE MATERIALIZED VIEW weekly_likes ... WITH DATA
+    DB->>DB: Runs query and saves result set to disk
 
-    Note over Tables: Data changes (INSERT / UPDATE / DELETE)
-    Client->>MV: SELECT * FROM weekly_likes
-    MV-->>Client: Returns STALE cached data (< 50ms)
+    Note over App,DB: Fast Reads
+    App->>MV: SELECT * FROM weekly_likes
+    MV-->>App: Returns saved results (~59ms)
 
-    Worker->>Engine: REFRESH MATERIALIZED VIEW weekly_likes
-    Engine->>Tables: Re-runs slow 3-way join query
-    Tables-->>Engine: Returns raw aggregated rows
-    Engine->>MV: Atomic disk cache replacement
+    Note over App,DB: Underlying Data Changes
+    App->>DB: DELETE FROM posts WHERE created_at is in January
+    App->>MV: SELECT * FROM weekly_likes
+    MV-->>App: Returns out-of-date results (cache not updated)
 
-    Client->>MV: SELECT * FROM weekly_likes
-    MV-->>Client: Returns FRESH updated data (< 50ms)
+    Note over App,DB: Refreshing Cache
+    App->>DB: REFRESH MATERIALIZED VIEW weekly_likes
+    DB->>DB: Re-runs query and updates saved results
+    App->>MV: SELECT * FROM weekly_likes
+    MV-->>App: Returns updated results
 ```
 
-> [!NOTE]
-> **Production Engineering Tip:** In high-traffic production environments, running `REFRESH MATERIALIZED VIEW weekly_likes;` locks the materialized view against concurrent `SELECT` queries while the refresh runs. If your view has a unique index, you can run `REFRESH MATERIALIZED VIEW CONCURRENTLY weekly_likes;` to allow read operations while the refresh recalculates in the background.
+### When to Use Materialized Views
 
-### Engineering Trade-Offs: Views vs. Materialized Views vs. Indexes
+Because materialized views require manual refreshing, they are best suited for calculating values that do **not change very often**.
 
-When optimizing analytical queries in backend engineering, multiple optimization techniques exist. Choosing the right one depends on update frequency and latency requirements:
+Weekly like aggregations are an ideal use case:
 
-| Strategy                               | When Query Runs                         | Storage Overhead                   | Freshness Guarantee             | Best Suited For                                                                  |
-| :------------------------------------- | :-------------------------------------- | :--------------------------------- | :------------------------------ | :------------------------------------------------------------------------------- |
-| **Standard View**                      | On every `SELECT` invocation            | Zero extra bytes (query text only) | 100% Real-time                  | Code reuse, simplifying complex joins, row/column security masking.              |
-| **B-Tree Indexes on Foreign Keys**     | Joins scan index trees at read time     | Moderate (index tree nodes)        | 100% Real-time                  | Speeding up joins and point lookups on frequently mutated transactional data.    |
-| **Materialized View**                  | Only at creation and explicit `REFRESH` | Stores complete result set on disk | Periodic / Eventual Consistency | Expensive reporting aggregations, weekly/monthly dashboards, historical metrics. |
-| **External Cache (Redis / Memcached)** | Fetched by app layer; cached in RAM     | High RAM cost outside DB           | Application-managed TTL         | High-frequency API endpoints needing sub-millisecond responses without DB hits.  |
+- Once a week passes, its historical post and comment counts rarely change.
+- The view does not need to be refreshed continuously; refreshing it once a day, once an hour, or once a week is often sufficient.
+
+#### Comparison of Approaches
+
+| Approach                                                    | Execution Behavior                       | Query Speed                                              | Data Freshness                 | When to Use                                                                  |
+| :---------------------------------------------------------- | :--------------------------------------- | :------------------------------------------------------- | :----------------------------- | :--------------------------------------------------------------------------- |
+| **Direct Query / Standard View**                            | Reruns query on every call               | Slow (2–30s)                                             | Always 100% current            | Data that changes constantly or simple queries.                              |
+| **Adding Indexes (on `likes.post_id`, `likes.comment_id`)** | Speeds up join operations on base tables | Faster than unindexed, but still recalculates aggregates | Always 100% current            | When query speed must improve while retaining real-time data accuracy.       |
+| **Materialized View**                                       | Runs query once; saves results to disk   | Very fast (~59ms)                                        | Stale until manually refreshed | Heavy analytical reports and historical aggregates that change infrequently. |
 
 ### Review Quiz
 
-<details><summary><b>Question 1: Why does replacing LEFT JOIN with INNER JOIN in the likes-posts-comments query return 0 rows?</b></summary><br><b>Answer:</b> In this domain model, a like record is polymorphic: it contains either a <code>post_id</code> or a <code>comment_id</code>, while the opposite foreign key is <code>NULL</code>. An <code>INNER JOIN</code> requires all join conditions to evaluate to true simultaneously across all joined tables. Because no single like record points to both a post and a comment at the same time, every row fails the joint match condition and is eliminated. A <code>LEFT JOIN</code> preserves rows from the left table even when right-table foreign keys are null.</details>
+<details><summary><b>Question 1: Why does using INNER JOIN instead of LEFT JOIN return zero rows when querying likes?</b></summary><br><b>Answer:</b> Each like record is associated with either a post or a comment, meaning one foreign key is always <code>NULL</code>. An <code>INNER JOIN</code> requires matching records across all joined tables simultaneously. Because no like belongs to both a post and a comment at the same time, an inner join eliminates every row. A <code>LEFT JOIN</code> keeps all rows from <code>likes</code> and inserts <code>NULL</code> for unmatched columns.</details>
 
-<details><summary><b>Question 2: What is the mechanical difference between a standard View and a Materialized View during a SELECT operation?</b></summary><br><b>Answer:</b> A standard view does not store any physical data; executing a <code>SELECT</code> on it causes PostgreSQL to dynamically expand and execute the underlying SQL query against the base tables in real time. A materialized view physically stores the precomputed query results on disk; executing a <code>SELECT</code> reads directly from this stored snapshot in milliseconds without re-executing joins or aggregations.</details>
+<details><summary><b>Question 2: What is the main difference between a standard View and a Materialized View?</b></summary><br><b>Answer:</b> A standard view does not store data on disk; it re-executes its underlying query every time it is queried. A materialized view executes its query and persists the result set on disk, allowing subsequent reads to return precomputed data in milliseconds without rerunning the query.</details>
 
-<details><summary><b>Question 3: How does date_trunc('week', timestamp) handle timestamps that occur mid-week?</b></summary><br><b>Answer:</b> The <code>date_trunc('week', timestamp)</code> function truncates the timestamp down to the beginning of that week's boundary (Monday at 00:00:00 UTC), zeroing out hours, minutes, and seconds. This normalizes all timestamps occurring within that 7-day interval into a single common date key for <code>GROUP BY</code> aggregation.</details>
+<details><summary><b>Question 3: What does the WITH DATA clause do when creating a materialized view?</b></summary><br><b>Answer:</b> <code>WITH DATA</code> tells PostgreSQL to execute the query immediately upon creation and populate the materialized view with data so it is ready to be queried.</details>
 
-<details><summary><b>Question 4: What is the main downside of a Materialized View, and how is it mitigated in production?</b></summary><br><b>Answer:</b> The main downside is data staleness: updates, inserts, and deletes on underlying tables do not propagate automatically to the materialized view. In production, this is mitigated by triggering <code>REFRESH MATERIALIZED VIEW</code> on a scheduled background schedule (such as an hourly or daily cron job/worker) or via database triggers when data changes.</details>
+<details><summary><b>Question 4: What happens to a materialized view when underlying records are deleted, and how do you fix it?</b></summary><br><b>Answer:</b> The materialized view does not automatically update; it continues to serve the old saved results (stale data). To synchronize it with the base tables, you must run <code>REFRESH MATERIALIZED VIEW [view_name];</code> to re-run the query and update the saved data.</details>
