@@ -103,7 +103,7 @@
    * [Database Schema Migrations in Practice](#database-schema-migrations-in-practice)
    * [Schema vs Data Migrations and Having a Plan](#schema-vs-data-migrations-and-having-a-plan)
    * [Full-Stack Database Integration: Architecture, Pooling, and Route Scaffolding](#full-stack-database-integration-architecture-pooling-and-route-scaffolding)
-   * [The Repository Pattern - Data Access Layer](#the-repository-pattern-data-access-layer)
+   * [The Repository Pattern - Data Access Layer](#the-repository-pattern---data-access-layer)
 
 
 <!-- TOC end -->
