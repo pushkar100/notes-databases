@@ -9008,6 +9008,7 @@ When you instantiate `new pg.Pool(options)`, **no network connection to PostgreS
 
 If an application boots up, starts listening on port 3005, and only attempts to connect when the first user request arrives, misconfigurations (such as an incorrect password or invalid database name) will remain hidden until that first request crashes with a database error.
 
+
 ```mermaid
 sequenceDiagram
     autonumber
@@ -9017,15 +9018,15 @@ sequenceDiagram
     participant App as src/app.js (Express)
 
     Node->>Pool: pool.connect(options)
-    Note over Pool: Instantiates internal new pg.Pool() [Lazy]
-    Pool->>PG: SELECT 1 + 1; (Validation Probe Query)
+    Note over Pool: Instantiates internal new pg.Pool() (Lazy)
+    Pool->>PG: SELECT 1 + 1 (Validation Probe Query)
     alt Credentials and Network Valid
         PG-->>Pool: Result: 2 (Connection Verified)
         Pool-->>Node: Promise.resolve()
         Node->>App: app().listen(3005)
         Note over Node: Server successfully listening on port 3005
     else Invalid Credentials or Host Unreachable
-        PG-->>Pool: Connection Refused / Auth Error
+        PG-->>Pool: Connection Refused or Auth Error
         Pool-->>Node: Promise.reject(err)
         Note over Node: Logs error to console and process halts
     end
