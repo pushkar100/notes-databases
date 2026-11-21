@@ -101,6 +101,7 @@
    * [Materialized Views and Query Caching](#materialized-views-and-query-caching)
    * [Database Transactions](#database-transactions)
    * [Database Schema Migrations in Practice](#database-schema-migrations-in-practice)
+   * [Schema vs Data Migrations and Having a Plan](#schema-vs-data-migrations-and-having-a-plan)
 
 
 <!-- TOC end -->
@@ -7713,7 +7714,6 @@ done
 | **Cross-Platform Portability** | Relies on Bash/sh environments; difficult to run reliably across Windows/macOS/Linux. | Platform-agnostic JavaScript CLI executed consistently via `npm run migrate`. |
 | **Developer Ergonomics** | Must manually manage tracking tables, rollback lookups, and transaction boundaries. | Automated file generation (`migrate create`), single-command rollbacks (`migrate down`), and status tracking. |
 
----
 
 ### Interactive Knowledge Check Quiz
 
@@ -7735,4 +7735,855 @@ done
 <details>
 <summary><b>Question 4: If you have already applied a migration to a shared staging or production database and realize you made a syntax or naming mistake, why should you NOT edit the existing migration file?</b></summary><br>
 <b>Answer:</b> The migration runner tracks applied migrations by filename and records them in <code>pgmigrations</code>. Editing an already-executed migration will not re-run it on existing databases (the runner sees it as already executed). Furthermore, it causes schema drift and inconsistency between existing databases and new environments. The correct approach is to create a new sequential migration file that applies the fix.
+</details>
+
+
+
+## Schema vs Data Migrations and Having a Plan
+
+### The Core Distinction: Schema Migrations vs. Data Migrations
+
+In database engineering, evolving a database requires managing two distinct categories of operations:
+
+1. **Schema Migrations (Structural Changes):**
+   - Alter the structural blueprint of the database.
+   - Operations include `CREATE TABLE`, `DROP TABLE`, `ALTER TABLE ADD COLUMN`, `ALTER TABLE DROP COLUMN`, and changing data types.
+   - In PostgreSQL, structural metadata changes (such as adding a nullable column or dropping a column) are fast and metadata-only operations that execute almost instantaneously.
+2. **Data Migrations (Content and Value Transformations):**
+   - Move, recalculate, reformat, or transform existing data rows without necessarily changing the table structure.
+   - Operations include splitting a `full_name` column into `first_name` and `last_name`, converting currencies, or merging separate coordinates into a combined spatial type.
+   - Unlike structural metadata updates, data migrations require inspecting and rewriting actual rows in database storage files (heaps). On large tables with millions of records, processing every row takes substantial time (from minutes to hours).
+
+```text
++-----------------------------------------------------------------------------------+
+|                     SCHEMA MIGRATION vs. DATA MIGRATION                          |
++-----------------------------------------------------------------------------------+
+|                                                                                   |
+|  SCHEMA MIGRATION (DDL)                 DATA MIGRATION (DML)                     |
+|  - Changes database structure           - Changes row data values                |
+|  - Fast / metadata-only in Postgres     - Heavy row scanning and rewriting       |
+|  - Example:                             - Example:                               |
+|    ALTER TABLE posts                     UPDATE posts                             |
+|    ADD COLUMN loc POINT;                 SET loc = POINT(lng, lat);               |
+|                                                                                   |
++-----------------------------------------------------------------------------------+
+```
+
+#### Real-World Example: Merging Coordinates into a Point Type
+
+Consider an image-sharing platform with a `posts` table containing geographic coordinates stored across two separate columns: `lat` (latitude) and `lng` (longitude).
+
+Over years of growth, the table scales to millions of records. The engineering team decides to merge `lat` and `lng` into a single column named `loc` using PostgreSQL's native `POINT` type. A `POINT` stores an `(x, y)` coordinate pair representing location on a two-dimensional surface:
+
+```text
++-----------------------------------------------------------------------------------+
+|                        MIGRATION GOAL: MERGING TWO COLUMNS                        |
++-----------------------------------------------------------------------------------+
+|                                                                                   |
+|  Initial Table Structure:              Target Table Structure:                    |
+|  +----+---------+-------+-------+       +----+---------+-------------------+      |
+|  | id | url     | lat   | lng   |  -->  | id | url     | loc               |      |
+|  +----+---------+-------+-------+       +----+---------+-------------------+      |
+|  | 1  | img1.jpg| 37.77 | -122.4|       | 1  | img1.jpg| (-122.4, 37.77)   |      |
+|  | 2  | img2.jpg| 40.71 | -74.00|       | 2  | img2.jpg| (-74.00, 40.71)   |      |
+|  +----+---------+-------+-------+       +----+---------+-------------------+      |
+|                                                                                   |
++-----------------------------------------------------------------------------------+
+```
+
+A common naive impulse is to combine all changes into a single migration file:
+1. Add the `loc` column.
+2. Copy and convert `lat` and `lng` values into `loc`.
+3. Drop the old `lat` and `lng` columns.
+
+While this works on an empty local development database, executing this in a production environment with live traffic leads to severe data loss and application downtime.
+
+### The Pitfall: Mixing Schema and Data Migrations in a Single Transaction
+
+To prevent partial schema corruption, database migration tools wrap migration files inside an atomic transaction (`BEGIN` ... `COMMIT`). If an error occurs midway, the transaction aborts and rolls back, leaving the database clean.
+
+However, executing a data migration inside that same transaction alongside schema changes introduces serious concurrency flaws.
+
+```text
++-----------------------------------------------------------------------------------+
+|             THE DANGER OF MIXING DATA AND SCHEMA MIGRATIONS IN ONE STEP           |
++-----------------------------------------------------------------------------------+
+|                                                                                   |
+|  Single Atomic Migration Transaction:                                             |
+|  1. ALTER TABLE posts ADD COLUMN loc POINT;        <-- Instantaneous              |
+|  2. UPDATE posts SET loc = POINT(lng, lat);        <-- Takes 45+ minutes on 5M rows|
+|  3. ALTER TABLE posts DROP COLUMN lat, DROP lng;   <-- Instantaneous              |
+|                                                                                   |
+|  TIMELINE & CONCURRENCY CONFLICT:                                                 |
+|                                                                                   |
+|  Migration Transaction (Isolation Snapshot)     Live API Server (Active Traffic)  |
+|  ------------------------------------------     --------------------------------  |
+|  [T0] Opens transaction & captures snapshot                                       |
+|  [T1] Adds 'loc' column                                                           |
+|  [T2] Starts iterating 5M rows to copy data                                       |
+|       |                                         [T3] User creates Post #5000001   |
+|       |                                              (writes lat, lng)            |
+|       |                                         [T4] User creates Post #5000002   |
+|       |                                              (writes lat, lng)            |
+|       | (New rows 5000001+ are invisible        --------------------------------  |
+|       |  to the migration's snapshot!)          These new rows sit outside the    |
+|       v                                         transaction snapshot.             |
+|  [T5] Finishes copy on older snapshot rows                                        |
+|  [T6] Drops 'lat' and 'lng' columns!                                              |
+|  [T7] Transaction commits changes               --------------------------------  |
+|                                                 CRITICAL FAILURE:                 |
+|                                                 Rows created during T2-T5 have    |
+|                                                 their lat/lng permanently deleted |
+|                                                 and their loc column is NULL!     |
++-----------------------------------------------------------------------------------+
+```
+
+#### Why This Failure Occurs
+
+1. **Snapshot Isolation:** When a database transaction opens, it reads from a snapshot of data at that point in time. Records inserted by the live application while the transaction runs are not visible to the long-running copy loop.
+2. **Column Deletion Without Transformation:** When the transaction reaches the final step and drops `lat` and `lng`, any rows created concurrently by the active API server lose their source coordinates forever. Because the migration script never processed those new rows, their `loc` column remains `NULL`.
+3. **Application Breakage:** The application server, still running code that expects `lat` and `lng` to exist, suddenly encounters runtime errors on every read and write the moment the migration commits.
+
+### The Five-Phase Zero-Downtime Migration Pattern
+
+To safely transform database schemas without taking the application offline or losing writes, modern engineering teams decouple the operation into **five discrete, independent phases**.
+
+Each phase can be safely deployed days or weeks apart, providing flexibility to verify each step in production before moving forward.
+
+```text
++-----------------------------------------------------------------------------------+
+|                     THE 5-PHASE ZERO-DOWNTIME BLUEPRINT                           |
++-----------------------------------------------------------------------------------+
+|                                                                                   |
+|  Phase 1: Database Migration (Schema)                                             |
+|  - Add new column 'loc POINT' allowing NULL.                                      |
+|  - App status: Unchanged (reads and writes lat/lng).                              |
+|                                                                                   |
+|  Phase 2: Application Code Deployment (Dual-Writing)                              |
+|  - Update API server to write to BOTH old (lat/lng) and new (loc) columns.        |
+|  - App status: All newly created/updated rows have complete data in both formats. |
+|                                                                                   |
+|  Phase 3: Backfill Script (Data Migration)                                        |
+|  - Background script calculates and populates 'loc' for historical rows where     |
+|    'loc IS NULL'.                                                                 |
+|  - App status: Fully operational; historical gaps are backfilled.                 |
+|                                                                                   |
+|  Phase 4: Application Code Deployment (Read/Write New Column Exclusively)         |
+|  - Update API server to read and write exclusively using 'loc'.                   |
+|  - App status: No longer references lat/lng. lat/lng become inactive.             |
+|                                                                                   |
+|  Phase 5: Database Migration (Schema Cleanup)                                     |
+|  - Drop old columns 'lat' and 'lng'.                                              |
+|  - App status: Table structure is clean, modern, and fully migrated.              |
+|                                                                                   |
++-----------------------------------------------------------------------------------+
+```
+
+#### Coordination Flow Across System Components
+
+```mermaid
+flowchart TD
+    classDef db fill:#e8f0fe,stroke:#4285f4,stroke-width:2px,color:#1a73e8;
+    classDef app fill:#e6f4ea,stroke:#34a853,stroke-width:2px,color:#137333;
+    classDef script fill:#fef7e0,stroke:#fbbc04,stroke-width:2px,color:#b06000;
+
+    subgraph "Phase 1: Add Column"
+        P1["Database: Add loc POINT (nullable)"]:::db
+    end
+
+    subgraph "Phase 2: Dual-Writing"
+        P2["App: Write to lat, lng AND loc simultaneously"]:::app
+    end
+
+    subgraph "Phase 3: Backfill Data"
+        P3["Script: Backfill WHERE loc IS NULL"]:::script
+    end
+
+    subgraph "Phase 4: Switch to New Column"
+        P4["App: Read and write ONLY loc"]:::app
+    end
+
+    subgraph "Phase 5: Drop Old Columns"
+        P5["Database: Drop lat and lng"]:::db
+    end
+
+    P1 --> P2
+    P2 --> P3
+    P3 --> P4
+    P4 --> P5
+```
+
+### Baseline Setup: Creating the Posts Table and Web Application
+
+To observe this pattern in practice, we establish a baseline database table and a lightweight web application.
+
+#### Database Migration: Adding the Posts Table
+
+Using the `node-pg-migrate` framework, generate an initial migration to create the `posts` table:
+
+```bash
+# Generate migration file
+npm run migrate create add-posts-table
+```
+
+Edit the generated migration file inside `migrations/`:
+
+```javascript
+/* migrations/1600000000000_add-posts-table.js */
+
+exports.up = (pgm) => {
+  // Create initial posts table with separate lat and lng columns
+  pgm.sql(`
+    CREATE TABLE posts (
+      id SERIAL PRIMARY KEY,
+      url VARCHAR(300),
+      lat NUMERIC,
+      lng NUMERIC
+    );
+  `);
+};
+
+exports.down = (pgm) => {
+  // Drop table on rollback
+  pgm.sql(`
+    DROP TABLE posts;
+  `);
+};
+```
+
+Run the migration against the database:
+
+```bash
+# Set connection string and apply migration
+DATABASE_URL=postgres://sg:@localhost:5432/socialnetwork npm run migrate up
+```
+
+```text
+> npm run migrate up
+
+> test-migrations@1.0.0 migrate
+> node-pg-migrate "up"
+
+Connecting to postgres://sg:@localhost:5432/socialnetwork
+### MIGRATION 1600000000000_add-posts-table (UP) ###
+CREATE TABLE posts (
+  id SERIAL PRIMARY KEY,
+  url VARCHAR(300),
+  lat NUMERIC,
+  lng NUMERIC
+);
+
+Migrated: 1600000000000_add-posts-table
+```
+
+#### Application Server Implementation
+
+Install dependencies:
+
+```bash
+npm install express pg
+```
+
+Create `index.js` representing our production web server. It connects to PostgreSQL via a connection pool (`pg.Pool`), exposes a `GET /posts` endpoint to view posts and a creation form, and a `POST /posts` endpoint to insert new rows:
+
+```javascript
+/* index.js - Baseline Implementation */
+const express = require('express');
+const { Pool } = require('pg');
+
+// Initialize database connection pool
+const pool = new Pool({
+  host: 'localhost',
+  port: 5432,
+  database: 'socialnetwork',
+  user: 'sg', // macOS default user; use 'postgres' on Windows/Linux
+  password: '' // supply password if configured
+});
+
+const app = express();
+app.use(express.urlencoded({ extended: true }));
+
+// Retrieve posts and render HTML table + submission form
+app.get('/posts', async (req, res) => {
+  const { rows } = await pool.query(`
+    SELECT * FROM posts;
+  `);
+
+  res.send(`
+    <table>
+      <thead>
+        <tr>
+          <th>ID</th>
+          <th>Longitude</th>
+          <th>Latitude</th>
+        </tr>
+      </thead>
+      <tbody>
+        ${rows
+          .map(
+            (row) => `
+          <tr>
+            <td>${row.id}</td>
+            <td>${row.lng}</td>
+            <td>${row.lat}</td>
+          </tr>
+        `
+          )
+          .join('')}
+      </tbody>
+    </table>
+
+    <form method="POST">
+      <h3>Create Post</h3>
+      <div>
+        <label>Longitude</label>
+        <input name="lng" />
+      </div>
+      <div>
+        <label>Latitude</label>
+        <input name="lat" />
+      </div>
+      <button type="submit">Create</button>
+    </form>
+  `);
+});
+
+// Receive form submission and insert post into database
+app.post('/posts', async (req, res) => {
+  const { lng, lat } = req.body;
+
+  // Parameterized query using $1, $2 placeholders
+  await pool.query(
+    `
+    INSERT INTO posts (lat, lng)
+    VALUES ($1, $2);
+  `,
+    [lat, lng]
+  );
+
+  res.redirect('/posts');
+});
+
+app.listen(3005, () => {
+  console.log('Server listening on port 3005');
+});
+```
+
+Start the application server:
+
+```bash
+node index.js
+```
+
+```text
+Server listening on port 3005
+```
+
+Navigating to `http://localhost:3005/posts` and submitting posts creates records in the database with populated `lat` and `lng` columns.
+
+### Phase One: Adding the New Nullable Column
+
+The first phase in zero-downtime evolution is to create the new column in the database.
+
+> [!IMPORTANT]
+> The new column **must** be created nullable (`NULL`) without a strict `NOT NULL` constraint. At this point, the existing application code knows nothing about the new column and will not supply values for it during write operations. Enforcing `NOT NULL` immediately would break all incoming production write requests.
+
+Generate and implement the migration:
+
+```bash
+npm run migrate create add-loc-to-posts
+```
+
+```javascript
+/* migrations/1600000000001_add-loc-to-posts.js */
+
+exports.up = (pgm) => {
+  // Add new column loc of spatial type point
+  pgm.sql(`
+    ALTER TABLE posts
+    ADD COLUMN loc POINT;
+  `);
+};
+
+exports.down = (pgm) => {
+  // Drop the column on rollback
+  pgm.sql(`
+    ALTER TABLE posts
+    DROP COLUMN loc;
+  `);
+};
+```
+
+Apply the migration:
+
+```bash
+DATABASE_URL=postgres://sg:@localhost:5432/socialnetwork npm run migrate up
+```
+
+```text
+Connecting to postgres://sg:@localhost:5432/socialnetwork
+### MIGRATION 1600000000001_add-loc-to-posts (UP) ###
+ALTER TABLE posts
+ADD COLUMN loc POINT;
+
+Migrated: 1600000000001_add-loc-to-posts
+```
+
+#### Verification and State Inspection
+
+Because `ALTER TABLE ... ADD COLUMN` without a default value is a metadata update in PostgreSQL, it completes instantaneously without row locking.
+
+Querying the database shows the new column present with existing records holding `NULL`:
+
+```sql
+SELECT id, lat, lng, loc FROM posts;
+```
+
+```text
+ id |  lat   |   lng   | loc 
+----+-------+---------+-----
+  1 | 37.77 | -122.41 | 
+  2 | 40.71 |  -74.00 | 
+(2 rows)
+```
+
+The web server continues serving requests uninterrupted, and users can create new posts without encountering errors.
+
+### Phase Two: Updating Application Code for Dual-Writing
+
+With the column available in the database, deploy an updated version of the application server.
+
+This update modifies write handlers to write to **both** the legacy columns (`lat`, `lng`) and the new column (`loc`).
+
+#### Dual-Write Implementation in PostgreSQL
+
+In PostgreSQL, a `POINT` literal is written as `' (x, y) '` where `x` represents horizontal coordinate (longitude) and `y` represents vertical coordinate (latitude).
+
+Update the `POST /posts` handler in `index.js`:
+
+```javascript
+/* index.js - Dual-Writing Update */
+
+app.post('/posts', async (req, res) => {
+  const { lng, lat } = req.body;
+
+  // Dual-writing: populate both lat/lng AND loc
+  await pool.query(
+    `
+    INSERT INTO posts (lat, lng, loc)
+    VALUES ($1, $2, $3);
+  `,
+    [lat, lng, `(${lng}, ${lat})`] // $3 receives formatted point string '(lng, lat)'
+  );
+
+  res.redirect('/posts');
+});
+```
+
+Restart the application server:
+
+```bash
+node index.js
+```
+
+#### Verifying Dual-Write State
+
+Create a new post through the browser form (e.g., `lng = -118.24`, `lat = 34.05`). Inspect the database:
+
+```sql
+SELECT id, lat, lng, loc FROM posts;
+```
+
+```text
+ id |  lat   |   lng   |        loc        
+----+-------+---------+-------------------
+  1 | 37.77 | -122.41 | 
+  2 | 40.71 |  -74.00 | 
+  3 | 34.05 | -118.24 | (-118.24, 34.05)
+(3 rows)
+```
+
+At this stage:
+- All new or updated records possess both old and new data representations.
+- Historical records (IDs 1 and 2) still have `loc = NULL`.
+- The system can stay in this state indefinitely without risk.
+
+### Deep Dive: Transaction Locks and Backfill Trade-offs
+
+Before running the backfill for historical rows, engineers must choose an execution strategy: application code vs. pure SQL.
+
+| Consideration | Option 1: Application-Level Script (Node.js / Python) | Option 2: Pure SQL Script (`UPDATE posts ...`) |
+| :--- | :--- | :--- |
+| **Execution Engine** | Application runtime processes rows | Database engine processes rows internally |
+| **Validation Capability** | Complex business logic and schema validators easily run in code | Limited to SQL expressions and database constraints |
+| **Memory Footprint** | Risk of Out-of-Memory (OOM) if loading millions of rows without batching | Minimal client memory; execution happens on database server |
+| **Network Overhead** | High: Millions of rows transferred back and forth across network | Zero: Data stays entirely within the database engine |
+| **Execution Speed** | Slower due to network round-trips and serialization | Fastest: Direct in-engine tuple manipulation |
+| **Environment Access** | Requires network access to database (difficult with private VPCs like AWS RDS) | Runs inside database VPC or administrative query session |
+
+#### The Danger of Row-Level Exclusive Locks
+
+Whenever an `UPDATE` executes inside a database transaction, PostgreSQL acquires a **row-level exclusive lock** (`FOR UPDATE`) on every modified row.
+
+While a row is locked:
+- Concurrent `SELECT` queries can still read the older committed version of the row without blocking (via Multiversion Concurrency Control / MVCC).
+- Any concurrent transaction attempting to `UPDATE`, `DELETE`, or lock that specific row is **blocked** and placed into a wait state until the holding transaction commits or rolls back.
+
+```text
++-----------------------------------------------------------------------------------+
+|               ROW-LEVEL TRANSACTION LOCKS AND APPLICATION BLOCKING                |
++-----------------------------------------------------------------------------------+
+|                                                                                   |
+|  Query Tool Window 1 (Backfill Transaction)   Query Tool Window 2 (User Request)  |
+|  ------------------------------------------   ----------------------------------  |
+|  BEGIN;                                                                           |
+|  UPDATE posts                                                                     |
+|  SET lat = 2 WHERE id = 1;                                                        |
+|  (PostgreSQL locks row id = 1!)                                                   |
+|                                               UPDATE posts                        |
+|                                               SET lat = 10 WHERE id = 1;          |
+|                                               (BLOCKED! Process hangs waiting     |
+|                                                for Window 1 to release lock...)   |
+|  ...                                                                              |
+|  COMMIT;                                                                          |
+|  (Lock released!) --------------------------> [Unblocks immediately!]             |
+|                                               Update succeeds with lat = 10.      |
+|                                                                                   |
++-----------------------------------------------------------------------------------+
+```
+
+> [!CAUTION]
+> If a backfill script wraps an update of 5,000,000 rows inside a single giant transaction, millions of rows become locked simultaneously. If an end user tries to edit their profile or like a post while that row is locked, their web request hangs until the migration finishes or web server request timeouts trigger widespread `504 Gateway Timeout` errors.
+
+#### Production Solution: Chunked / Batched Updates
+
+To prevent broad lock contention on high-scale systems, backfills should be broken into bounded chunks (e.g., 1,000 to 5,000 records per transaction):
+
+```sql
+-- Pattern for batched backfill without prolonged row locks
+UPDATE posts
+SET loc = POINT(lng, lat)
+WHERE id IN (
+  SELECT id FROM posts
+  WHERE loc IS NULL
+  LIMIT 5000
+);
+```
+
+Each small batch locks only 5,000 rows for milliseconds, commits, and releases locks, allowing normal application traffic to proceed without noticeable latency spikes.
+
+### Phase Three: Executing the Data Backfill Script
+
+For our application, we implement the backfill using Option 2 (a pure SQL update executed via a Node.js management script).
+
+To maintain clean project organization:
+- Keep the script separate from standard schema migrations so the migration runner (`node-pg-migrate`) does not treat it as a structural change.
+- Place it in a dedicated `migrations/data/` directory so it is tracked in Git, peer-reviewed, and easily executable in staging and production environments.
+
+Create the file `migrations/data/01-lng-lat-to-loc.js`:
+
+```javascript
+/* migrations/data/01-lng-lat-to-loc.js */
+const { Pool } = require('pg');
+
+const pool = new Pool({
+  host: 'localhost',
+  port: 5432,
+  database: 'socialnetwork',
+  user: 'sg',
+  password: ''
+});
+
+// Run backfill query targeting only rows missing loc
+pool
+  .query(
+    `
+    UPDATE posts
+    SET loc = POINT(lng, lat)
+    WHERE loc IS NULL;
+  `
+  )
+  .then(() => {
+    console.log('Update complete: All historical rows backfilled.');
+    pool.end();
+  })
+  .catch((err) => {
+    console.error('Backfill error:', err.message);
+    pool.end();
+  });
+```
+
+Run the backfill script:
+
+```bash
+node migrations/data/01-lng-lat-to-loc.js
+```
+
+```text
+Update complete: All historical rows backfilled.
+```
+
+#### Verification
+
+Query the database to ensure zero records remain with `loc IS NULL`:
+
+```sql
+SELECT id, lat, lng, loc FROM posts;
+```
+
+```text
+ id |  lat   |   lng   |        loc        
+----+-------+---------+-------------------
+  1 | 37.77 | -122.41 | (-122.41, 37.77)
+  2 | 40.71 |  -74.00 | (-74.00, 40.71)
+  3 | 34.05 | -118.24 | (-118.24, 34.05)
+(3 rows)
+```
+
+Every historical row and newly inserted row now contains a valid `loc` value.
+
+### Phase Four: Switching Application Code to New Column Exclusively
+
+With all data backfilled and all incoming writes dual-writing to `loc`, the legacy columns (`lat`, `lng`) are officially obsolete.
+
+We now deploy the next version of the application server:
+1. **Reads:** Query and display values from `loc`. In the `pg` driver, a `POINT` column is parsed into a JavaScript object containing `x` (longitude) and `y` (latitude) properties (`row.loc.x`, `row.loc.y`).
+2. **Writes:** Insert exclusively into `loc`. Remove all references to `lat` and `lng`.
+
+> [!TIP]
+> The public-facing HTTP interface does not need to change. The web form can continue collecting separate longitude and latitude inputs from users; the application server simply packages them into the database's internal `POINT` representation before writing.
+
+Update `index.js`:
+
+```javascript
+/* index.js - New Column Exclusively */
+const express = require('express');
+const { Pool } = require('pg');
+
+const pool = new Pool({
+  host: 'localhost',
+  port: 5432,
+  database: 'socialnetwork',
+  user: 'sg',
+  password: ''
+});
+
+const app = express();
+app.use(express.urlencoded({ extended: true }));
+
+app.get('/posts', async (req, res) => {
+  const { rows } = await pool.query(`
+    SELECT * FROM posts;
+  `);
+
+  res.send(`
+    <table>
+      <thead>
+        <tr>
+          <th>ID</th>
+          <th>Longitude</th>
+          <th>Latitude</th>
+        </tr>
+      </thead>
+      <tbody>
+        ${rows
+          .map(
+            (row) => `
+          <tr>
+            <td>${row.id}</td>
+            <!-- Accessing Point coordinates parsed as {x, y} by pg driver -->
+            <td>${row.loc ? row.loc.x : ''}</td>
+            <td>${row.loc ? row.loc.y : ''}</td>
+          </tr>
+        `
+          )
+          .join('')}
+      </tbody>
+    </table>
+
+    <form method="POST">
+      <h3>Create Post</h3>
+      <div>
+        <label>Longitude</label>
+        <input name="lng" />
+      </div>
+      <div>
+        <label>Latitude</label>
+        <input name="lat" />
+      </div>
+      <button type="submit">Create</button>
+    </form>
+  `);
+});
+
+app.post('/posts', async (req, res) => {
+  const { lng, lat } = req.body;
+
+  // Writing strictly to the loc column
+  await pool.query(
+    `
+    INSERT INTO posts (loc)
+    VALUES ($1);
+  `,
+    [`(${lng}, ${lat})`]
+  );
+
+  res.redirect('/posts');
+});
+
+app.listen(3005, () => {
+  console.log('Server listening on port 3005');
+});
+```
+
+Restart the application server:
+
+```bash
+node index.js
+```
+
+#### Verifying Exclusive Use of the New Column
+
+Create a post via the web form with `lng = 10.0`, `lat = 20.0`. Inspect the database:
+
+```sql
+SELECT id, lat, lng, loc FROM posts WHERE id = 4;
+```
+
+```text
+ id | lat | lng |     loc     
+----+-----+-----+-------------
+  4 |     |     | (10.0, 20.0)
+(1 row)
+```
+
+The new post has `lat` and `lng` as `NULL`, while `loc` is properly populated. The application renders the post correctly using `row.loc.x` and `row.loc.y`. The legacy columns are completely decoupled from active application traffic.
+
+### Phase Five: Dropping Deprecated Columns
+
+Because no running application code references `lat` or `lng`, we can safely drop both columns via a final schema migration.
+
+#### Multi-Column Drop Migration
+
+In PostgreSQL, multiple columns can be removed in a single DDL statement: `ALTER TABLE posts DROP COLUMN lat, DROP COLUMN lng;`.
+
+Generate the cleanup migration:
+
+```bash
+npm run migrate create drop-lng-and-lat-from-posts
+```
+
+```javascript
+/* migrations/1600000000002_drop-lng-and-lat-from-posts.js */
+
+exports.up = (pgm) => {
+  // Drop both deprecated columns simultaneously
+  pgm.sql(`
+    ALTER TABLE posts
+    DROP COLUMN lat,
+    DROP COLUMN lng;
+  `);
+};
+
+exports.down = (pgm) => {
+  // Restore columns on rollback (nullable numeric)
+  pgm.sql(`
+    ALTER TABLE posts
+    ADD COLUMN lat NUMERIC,
+    ADD COLUMN lng NUMERIC;
+  `);
+};
+```
+
+Apply the final migration:
+
+```bash
+DATABASE_URL=postgres://sg:@localhost:5432/socialnetwork npm run migrate up
+```
+
+```text
+Connecting to postgres://sg:@localhost:5432/socialnetwork
+### MIGRATION 1600000000002_drop-lng-and-lat-from-posts (UP) ###
+ALTER TABLE posts
+DROP COLUMN lat,
+DROP COLUMN lng;
+
+Migrated: 1600000000002_drop-lng-and-lat-from-posts
+```
+
+#### Final Schema Verification
+
+Inspect the table columns in PostgreSQL:
+
+```sql
+\d posts
+```
+
+```text
+                               Table "public.posts"
+ Column |          Type          |                     Modifiers                      
+--------+------------------------+----------------------------------------------------
+ id     | integer                | not null default nextval('posts_id_seq'::regclass)
+ url    | character varying(300) | 
+ loc    | point                  | 
+Indexes:
+    "posts_pkey" PRIMARY KEY, btree (id)
+```
+
+Verify table records:
+
+```sql
+SELECT * FROM posts;
+```
+
+```text
+ id | url |        loc        
+----+-----+-------------------
+  1 |     | (-122.41, 37.77)
+  2 |     | (-74.00, 40.71)
+  3 |     | (-118.24, 34.05)
+  4 |     | (10.0, 20.0)
+(4 rows)
+```
+
+#### Complete Five-Phase Rollout Summary
+
+| Phase | Component Changed | Action Taken | Database State | Application State |
+| :--- | :--- | :--- | :--- | :--- |
+| **Phase 1** | Database Migration | `ADD COLUMN loc POINT` | `loc` exists with `NULL`s | Reads/writes `lat`, `lng` |
+| **Phase 2** | Application Server | Deploy dual-writing code | New rows populate both | Writes both formats |
+| **Phase 3** | Data Script | Run backfill script | All historical rows populated | Fully operational |
+| **Phase 4** | Application Server | Deploy new-column-only code | Legacy columns receive `NULL` | Reads/writes `loc` only |
+| **Phase 5** | Database Migration | `DROP COLUMN lat, lng` | Clean, modern schema | Operational, zero downtime |
+
+### Interactive Knowledge Check Quiz
+
+<details>
+<summary><b>Question 1: What is the fundamental difference between a schema migration and a data migration?</b></summary>
+<br>
+<b>Answer:</b> A <b>schema migration</b> modifies the architectural structure or metadata of the database (such as adding/dropping tables or columns via DDL statements like <code>CREATE TABLE</code> or <code>ALTER TABLE</code>) and is typically instantaneous in PostgreSQL. A <b>data migration</b> inspects, transforms, or moves row values within the database (via DML statements like <code>UPDATE</code>) and requires scanning and rewriting actual storage pages, which can take hours on tables with millions of records.
+</details>
+
+<details>
+<summary><b>Question 2: Why does executing a long-running data backfill inside a single schema migration transaction cause lost writes in production?</b></summary>
+<br>
+<b>Answer:</b> When a transaction opens, it operates against an isolated snapshot of the database. If a data backfill takes 45 minutes inside that transaction, any new rows inserted by the live application during those 45 minutes exist outside that snapshot and are not processed by the backfill. When the transaction finishes and executes <code>DROP COLUMN</code>, the legacy values for those new rows are permanently destroyed, leaving the new column as <code>NULL</code>.
+</details>
+
+<details>
+<summary><b>Question 3: Why MUST a new replacement column be added as nullable (allowing NULL) during Phase 1?</b></summary>
+<br>
+<b>Answer:</b> In Phase 1, the database schema changes before application code is updated. The currently running production application code does not know the new column exists and does not provide a value for it during inserts. If the column had a <code>NOT NULL</code> constraint without a default value, every insert request from the active application would immediately fail with constraint violation errors.
+</details>
+
+<details>
+<summary><b>Question 4: What is a row-level exclusive lock in PostgreSQL, and how does a massive transaction cause downtime?</b></summary>
+<br>
+<b>Answer:</b> When an <code>UPDATE</code> statement runs inside a transaction, PostgreSQL places an exclusive lock on every modified row. Any other concurrent transaction attempting to update or delete those same rows is blocked and forced to wait until the holding transaction commits or rolls back. In a massive update touching millions of rows at once, user-initiated update requests hang until database or HTTP gateway timeouts (such as 504 Gateway Timeout) trigger widespread errors.
+</details>
+
+<details>
+<summary><b>Question 5: How does the pg Node.js driver represent PostgreSQL POINT data types in JavaScript?</b></summary>
+<br>
+<b>Answer:</b> The <code>pg</code> driver automatically parses a PostgreSQL <code>POINT</code> column into a JavaScript object with <code>x</code> and <code>y</code> numeric properties: <code>{ x: longitude, y: latitude }</code>. In application code, coordinates are accessed using <code>row.loc.x</code> and <code>row.loc.y</code>.
 </details>
