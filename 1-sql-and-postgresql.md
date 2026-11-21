@@ -100,6 +100,7 @@
    * [Simplifying Queries with Views](#simplifying-queries-with-views)
    * [Materialized Views and Query Caching](#materialized-views-and-query-caching)
    * [Database Transactions](#database-transactions)
+   * [Database Schema Migrations in Practice](#database-schema-migrations-in-practice)
 
 
 <!-- TOC end -->
@@ -7031,4 +7032,707 @@ The following table summarizes the four paths by which a PostgreSQL transaction 
 <summary><b>Question 4: What causes the error message "current transaction is aborted, commands ignored until end of transaction block", and how do you recover?</b></summary>
 <br>
 <b>Answer:</b> This occurs when a query inside an active transaction encounters an error (such as referencing an invalid table or violating a constraint). PostgreSQL enters an aborted state to protect against further mutations. You recover by issuing <code>ROLLBACK;</code>, which closes the transaction block and resets the connection for normal queries.
+</details>
+
+
+
+## Database Schema Migrations in Practice
+
+### The Story of Schema Migrations: Why Manual Database Changes Fail
+
+To understand why database schema migrations exist in software engineering, consider a classic scenario encountered on modern production systems. Imagine working as an engineer on a high-scale application (such as Instagram) with responsibility for managing the database backing the comments system.
+
+In this environment, you typically work across two distinct PostgreSQL instances:
+1. **Local Development Database:** Hosted on your personal workstation to build features, test schema changes, and verify queries safely without touching real user records.
+2. **Production Database:** Hosted on cloud infrastructure (e.g., Amazon Web Services RDS) holding actual live customer data and handling thousands of requests per second.
+
+```text
++---------------------------------------------------------------------------------+
+|                        THE DANGER OF MANUAL SCHEMA DRIFT                        |
++---------------------------------------------------------------------------------+
+|                                                                                 |
+|  [Developer Machine]                                                            |
+|  +--------------------+                                                         |
+|  | Local Postgres DB  | <-- Manually altered (has 'body')                       |
+|  +--------------------+                                                         |
+|           |                                                                     |
+|           | Direct manual SQL (ALTER TABLE comments RENAME COLUMN contents TO body)
+|           v                                                                     |
+|  [AWS Production DB]                                                            |
+|  +--------------------+                                                         |
+|  | Production DB      | <-- Column 'contents' renamed to 'body'                 |
+|  +--------------------+                                                         |
+|           ^                                                                     |
+|           | Queries: SELECT contents FROM comments;                             |
+|           |                                                                     |
+|  [Live Web Servers]                                                             |
+|  +--------------------+                                                         |
+|  | Production Backend | <-- Still running older release (expects 'contents')   |
+|  +--------------------+                                                         |
+|           |                                                                     |
+|           v                                                                     |
+|  [HTTP 500 CRASH] ===> Thousands of user requests fail immediately!             |
++---------------------------------------------------------------------------------+
+```
+
+#### The Real-World Breakdown
+
+Suppose fellow developers point out that the `contents` column on the `comments` table is awkwardly named: `comments` and `contents` sound nearly identical, and engineers constantly struggle to remember whether it is singular (`content`) or plural (`contents`). The agreed solution is simple: rename the column from `contents` to `body`.
+
+In PostgreSQL, renaming a column is instantaneous and straightforward:
+
+```sql
+ALTER TABLE comments RENAME COLUMN contents TO body;
+```
+
+You execute this statement in your local development environment via a graphical interface like pgAdmin or psql. The query executes in milliseconds without error. Confident that the change is safe and low-risk, you connect directly to the AWS production database and execute the exact same `ALTER TABLE` statement.
+
+Immediately, serious production failures emerge:
+
+1. **Client-Server Desynchronization (Production Outage):** While the production database was updated instantly, the active production backend servers handling 10,000 requests per second are still executing existing application code. Those servers are dispatching queries such as `SELECT contents FROM comments;` or `INSERT INTO comments (contents) VALUES (...);`. Because the column `contents` no longer exists, PostgreSQL rejects every incoming query with a fatal error. The web servers throw unhandled 500 Internal Server Errors, breaking the user interface for all active users.
+2. **Team Desynchronization & Schema Drift:** Even after deploying updated backend server code that references `body`, teammate environments break. Other engineers working on their own local machines pull the latest Git commits containing the updated server code. However, their local PostgreSQL databases still have the old `contents` column. Their local servers crash on startup, integration tests fail, and no automated mechanism exists to tell them what database modifications occurred or how to recreate them.
+
+```mermaid
+flowchart TD
+    subgraph Local_Dev ["1. Local Development"]
+        LocalDB["Local Postgres"]
+        LocalDev["Developer runs manual SQL:<br/>RENAME COLUMN contents TO body"]
+        LocalDev --> LocalDB
+        LocalTest["Local queries pass"]
+        LocalDB --> LocalTest
+    end
+```
+```mermaid
+flowchart TD
+    subgraph Production_Outage ["2. Production Deployment Mismatch"]
+        ProdDB["AWS Production Postgres"]
+        ProdApp["Production Web Servers<br/>(Still running old code)"]
+        ApplyProd["Developer runs manual SQL on Prod"]
+        ApplyProd --> ProdDB
+        ProdApp -->|"SELECT contents FROM comments"| ProdDB
+        ProdDB -->|"ERROR: column 'contents' does not exist"| ProdApp
+        ProdApp -->|"500 Internal Server Errors"| Users["Active End Users (Outage)"]
+    end
+```
+```mermaid
+flowchart TD
+    subgraph Team_Mismatch ["3. Team Schema Drift"]
+        TeamDev["Teammate (Local Dev)"]
+        TeamCode["Pulls latest backend code (expects 'body')"]
+        TeamDB["Local Postgres (still has 'contents')"]
+        TeamCode -->|"Fails on teammate machine"| TeamDB
+    end
+```
+
+#### Core Engineering Lessons
+
+- **Lesson 1: Database changes and application code must be coordinated and released in sync.** You cannot treat database modifications as isolated manual actions outside your deployment pipeline.
+- **Lesson 2: Database structure must be versioned alongside codebase history.** Every engineer, automated test runner, and cloud environment must be able to automatically advance or rewind the database schema to match any specific Git branch or commit.
+
+### Anatomy and Lifecycle of a Migration File
+
+A schema migration file is an isolated, version-controlled source file containing the precise instructions needed to transition a database schema from one structural state to the next.
+
+```text
++---------------------------------------------------------------------------------+
+|                          ANATOMY OF A MIGRATION FILE                            |
++---------------------------------------------------------------------------------+
+|                                                                                 |
+|  Migration File: 1604505000000_table-comments.js                                |
+|                                                                                 |
+|  +---------------------------------------------------------------------------+  |
+|  | UP (Upgrade / Forward Step)                                               |  |
+|  | - Applied when advancing database state.                                  |  |
+|  | - Example: CREATE TABLE comments (...);                                   |  |
+|  +---------------------------------------------------------------------------+  |
+|                                       |                                         |
+|                                       v                                         |
+|  +---------------------------------------------------------------------------+  |
+|  | DOWN (Rollback / Backward Step)                                           |  |
+|  | - Applied when reverting or undoing the change.                           |  |
+|  | - Example: DROP TABLE comments;                                           |  |
+|  +---------------------------------------------------------------------------+  |
+|                                                                                 |
++---------------------------------------------------------------------------------+
+```
+
+#### Fundamental Characteristics of Migration Files
+
+- **Language Agnostic Concept:** Although migrations in a Node.js project may be written in JavaScript or raw SQL, migration concepts are identical across Ruby on Rails, Django, Go, Java, and .NET.
+- **Dual-Direction Execution (Up and Down):**
+  - **Up (Upgrade / Forward):** Contains the exact commands required to advance or modify database structure (e.g., creating a table, adding a foreign key, altering a column name).
+  - **Down (Downgrade / Revert):** Contains the inverse commands that completely undo what `Up` performed (e.g., dropping the created table, reverting the renamed column).
+- **Symmetric Reversibility:** Running `Up` followed immediately by `Down` must return the database schema to the exact state it was in before `Up` executed.
+
+```mermaid
+flowchart LR
+    subgraph Up_Path ["Up / Forward Migration"]
+        direction LR
+        StateA["Empty Database"] -->|"npm run migrate up<br/>(Migration 1: CREATE TABLE)"| StateB["Comments Table<br/>(contents)"]
+        StateB -->|"npm run migrate up<br/>(Migration 2: RENAME COLUMN)"| StateC["Comments Table<br/>(body)"]
+    end
+
+    subgraph Down_Path ["Down / Rollback Migration"]
+        direction LR
+        StateC -->|"npm run migrate down<br/>(Migration 2 Down: RENAME COLUMN)"| StateB
+        StateB -->|"npm run migrate down<br/>(Migration 1 Down: DROP TABLE)"| StateA
+    end
+```
+
+#### Terminology
+
+| Term | Operational Meaning | Real-World Action |
+| :--- | :--- | :--- |
+| **Apply (`up`)** | Executing pending migration files to advance the database schema. | Run `npm run migrate up` to create tables or columns. |
+| **Revert / Rollback (`down`)** | Undoing the most recently executed migration file. | Run `npm run migrate down` to undo a faulty structural change. |
+| **Schema Drift** | Discrepancy where two database instances have divergent structures. | Prevented because all instances execute identical migration files. |
+
+> [!NOTE]
+> When a new engineer joins the engineering team, they do not need manual database export dumps or instructions in a README. They clone the repository, run the migration tool against a blank local PostgreSQL database, and their schema is built sequentially to match production.
+
+### Core Software Engineering Challenges Solved by Migrations
+
+Using automated schema migration files resolves the primary pain points of collaborative software development:
+
+```text
++---------------------------------------------------------------------------------+
+|                       MIGRATION SYNCHRONIZATION WORKFLOW                        |
++---------------------------------------------------------------------------------+
+|                                                                                 |
+|  [Git Repository]                                                               |
+|  +---------------------------------------------------------------------------+  |
+|  | Application Code + ./migrations/ Directory                                |  |
+|  | - 1604505000000_table-comments.js                                         |  |
+|  | - 1604505999999_rename-contents-to-body.js                                |  |
+|  +---------------------------------------------------------------------------+  |
+|              |                                             |                    |
+|        git pull                                      git pull                   |
+|              v                                             v                    |
+|    [Teammate Workstation]                        [CI / Staging / Production]    |
+|    +-----------------------------+               +----------------------------+ |
+|    | Runs: npm run migrate up    |               | Runs: npm run migrate up   | |
+|    | Reads 'pgmigrations' table  |               | Reads 'pgmigrations' table | |
+|    | Applies only pending steps  |               | Applies only pending steps | |
+|    +-----------------------------+               +----------------------------+ |
+|                  |                                             |                |
+|                  v                                             v                |
+|    Database Schema matches Code!                 Database Schema matches Code!  |
++---------------------------------------------------------------------------------+
+```
+
+1. **Version Controlled Infrastructure:** Database definitions reside in Git alongside backend controllers, models, and routes. Every schema alteration has author attribution, commit messages, and pull request reviews.
+2. **Repeatable Multi-Environment Deployments:** Automated scripts apply migrations uniformly across Local, Continuous Integration (CI), Staging, and Production databases without error-prone manual SQL execution.
+3. **Collision Detection & Seamless Merging:** If two developers create separate migrations simultaneously on different Git branches, both files receive unique timestamp prefixes. The migration runner executes them in deterministic order upon merge.
+4. **Instant Safe Rollbacks:** If a deployment exposes unexpected production defects, the engineering team can roll back the application code and run the `down` migration to cleanly revert the schema without manual emergency hotfixes.
+
+### Migration Tooling Ecosystem: Design Patterns and SQL vs. DSLs
+
+Migration libraries exist across all major web ecosystems. Understanding how different tools approach migrations helps engineers choose the right strategy for their architecture.
+
+#### Industry Migration Libraries
+
+- **Node.js / TypeScript:** `node-pg-migrate`, `Knex.js`, `TypeORM`, `Sequelize`, `Prisma`
+- **Python:** `Alembic` (SQLAlchemy), `Django Migrations`
+- **Ruby:** `Active Record Migrations` (Ruby on Rails)
+- **Java / Kotlin:** `Flyway`, `Liquibase`
+- **Go:** `golang-migrate`, `Goose`
+
+#### Architectural Comparison: Raw SQL vs. Programmatic DSLs
+
+Migration libraries typically follow one of three architectural patterns:
+
+| Pattern | How It Works | Advantages | Trade-Offs |
+| :--- | :--- | :--- | :--- |
+| **Pure SQL Migrations** | Migration files contain standard `.sql` scripts executed directly by the database driver. | 100% database feature support; no abstractions; readable by any DBA. | Must write separate `up.sql` and `down.sql` files manually; database-specific syntax. |
+| **Programmatic DSL (JS/Python API)** | Uses helper methods like `pgm.createTable('users', {...})` to define tables programmatically. | Clean syntax; can auto-generate reverse statements; language type checking. | Limited to features supported by the DSL; complex PostgreSQL features can be difficult to express. |
+| **Hybrid Approach (`node-pg-migrate`)** | Programmatic migration framework with built-in `pgm.sql(\`...\`)` escape hatch. | Best of both worlds: programmatic CLI runner + full power of raw PostgreSQL SQL. | Requires discipline to write matching `down` statements accurately. |
+
+#### Why `node-pg-migrate` for PostgreSQL
+
+In this module, `node-pg-migrate` is selected because:
+1. **Lightweight & Dedicated:** Unlike heavy ORMs (like TypeORM or Sequelize) that force specific active-record or data-mapper paradigms, `node-pg-migrate` focuses exclusively on running PostgreSQL schema migrations cleanly.
+2. **PostgreSQL-Specific Capabilities:** It directly supports PostgreSQL-specific data types (`TIMESTAMPTZ`, `SERIAL`, UUIDs, JSONB) and syntax without awkward ORM translation layers.
+3. **Transparent Execution:** It allows direct execution of raw SQL via `pgm.sql(...)`, ensuring engineers know exactly what queries run against the database.
+
+### Project Initialization and Environment Configuration
+
+To manage database migrations in a Node.js project, we initialize a dedicated package structure and install both the migration framework and the official PostgreSQL driver.
+
+#### Initializing Project and Installing Dependencies
+
+From your terminal, create a project directory (or use your existing repository root) and initialize `package.json`:
+
+```bash
+# Initialize a new Node.js package with defaults
+npm init -y
+
+# Install node-pg-migrate (CLI migration runner) and pg (PostgreSQL client driver)
+npm install node-pg-migrate pg
+```
+
+##### Expected Output Sample
+
+```text
+Wrote to /Users/pushkar/Desktop/practice/package.json:
+{
+  "name": "practice",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo "Error: no test specified" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC"
+}
+
+added 42 packages, and audited 43 packages in 2s
+```
+
+> [!IMPORTANT]
+> The `pg` package (`node-postgres`) is a mandatory peer dependency for `node-pg-migrate`. Under the hood, `node-pg-migrate` uses `pg` to establish network socket connections to PostgreSQL, manage transactions, and run queries.
+
+#### Configuring Migration Scripts in `package.json`
+
+Open `package.json` and add a `migrate` script pointing to the `node-pg-migrate` CLI executable:
+
+```json
+{
+  "name": "practice",
+  "version": "1.0.0",
+  "scripts": {
+    "migrate": "node-pg-migrate"
+  },
+  "dependencies": {
+    "node-pg-migrate": "^7.8.0",
+    "pg": "^8.13.0"
+  }
+}
+```
+
+Now, any migration command can be invoked through `npm run migrate <subcommand>`.
+
+### Generating, Authoring, and Structuring Initial Migrations
+
+#### Generating a Migration File
+
+To generate an empty, timestamped migration template, execute `npm run migrate create` followed by a descriptive name describing the schema change:
+
+```bash
+# Generate the initial comments table migration
+npm run migrate create table comments
+```
+
+##### Expected Output Sample
+
+```text
+> practice@1.0.0 migrate
+> node-pg-migrate create table comments
+
+Created migration -- /Users/pushkar/Desktop/practice/migrations/1604505000000_table-comments.js
+```
+
+`node-pg-migrate` automatically creates a `./migrations/` directory if one does not exist and writes a new file named with a millisecond timestamp prefix followed by your specified name (e.g., `1604505000000_table-comments.js`).
+
+> [!TIP]
+> The numeric timestamp prefix ensures that migration files are always executed in the exact chronological sequence in which they were created, regardless of file system sorting.
+
+#### Authoring the Up and Down Logic
+
+Open the newly created migration file in your editor. The scaffolded template exports `shorthands`, an `up` function, and a `down` function:
+
+```javascript
+/* eslint camelcase: 0 */
+
+exports.shorthands = undefined;
+
+/**
+ * Apply schema modifications (Forward / Upgrade)
+ * @param {import('node-pg-migrate').MigrationBuilder} pgm
+ */
+exports.up = (pgm) => {
+  pgm.sql(`
+    CREATE TABLE comments (
+      id SERIAL PRIMARY KEY,
+      created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+      contents VARCHAR(240) NOT NULL
+    );
+  `);
+};
+
+/**
+ * Revert schema modifications (Backward / Rollback)
+ * @param {import('node-pg-migrate').MigrationBuilder} pgm
+ */
+exports.down = (pgm) => {
+  pgm.sql(`
+    DROP TABLE comments;
+  `);
+};
+```
+
+#### Key Technical Mechanics
+
+- **The `pgm` Object:** `pgm` is an instance of `MigrationBuilder` injected into both functions by `node-pg-migrate`.
+- **`pgm.sql(query)`:** Instructs the migration runner to execute a raw SQL query.
+- **Symmetry:** The `up` block creates the `comments` table with `id`, `created_at`, `updated_at`, and `contents`. The `down` block performs the exact reverse by dropping the `comments` table.
+
+### Applying, Tracking, and Rolling Back Migrations
+
+To apply a migration, `node-pg-migrate` must know which PostgreSQL database instance to connect to. This connection is configured via the standard `DATABASE_URL` environment variable.
+
+#### Connection String Structure
+
+```text
+postgres://[username]:[password]@[hostname]:[port]/[database_name]
+```
+
+- **Username / Password:** Credentials for the PostgreSQL user (e.g., `postgres:postgres` or your local system user).
+- **Hostname / Port:** Where PostgreSQL is listening (default: `localhost:5432`).
+- **Database Name:** The target database (e.g., `social_network`).
+
+#### Cross-Platform Execution Commands
+
+Depending on your operating system and shell environment, supply `DATABASE_URL` inline with `npm run migrate up`:
+
+```bash
+# macOS / Linux (Default bash/zsh with Postgres.app or local service)
+DATABASE_URL=postgres://pushkar:password@localhost:5432/social_network npm run migrate up
+
+# Windows Git Bash
+DATABASE_URL=postgres://postgres:password@localhost:5432/social_network npm run migrate up
+
+# Windows Command Prompt (CMD - Note no spaces before &&)
+set DATABASE_URL=postgres://postgres:password@localhost:5432/social_network&& npm run migrate up
+
+# Windows PowerShell
+$env:DATABASE_URL="postgres://postgres:password@localhost:5432/social_network"; npm run migrate up
+```
+
+##### Expected Output Sample (Applying Migrations)
+
+```text
+> practice@1.0.0 migrate
+> node-pg-migrate up
+
+> Migrating files:
+> - 1604505000000_table-comments.js
+### MIGRATION 1604505000000_table-comments.js (UP) ###
+CREATE TABLE comments (
+      id SERIAL PRIMARY KEY,
+      created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+      contents VARCHAR(240) NOT NULL
+    );
+
+Migrations complete!
+```
+
+#### How Migration State is Tracked: The `pgmigrations` Table
+
+When `node-pg-migrate up` runs for the first time, it automatically creates a dedicated internal tracking table in PostgreSQL named `pgmigrations`.
+
+```mermaid
+flowchart TD
+    Runner["Migration Runner (node-pg-migrate)"]
+    Files["Local Migration Files:<br/>1. 1604505000000_table-comments.js<br/>2. 1604505999999_rename-contents-to-body.js"]
+    TrackingTable["PostgreSQL: 'pgmigrations' Table"]
+
+    Runner -->|"1. Reads files on disk"| Files
+    Runner -->|"2. Queries recorded rows"| TrackingTable
+    Runner -->|"3. Compares executed vs disk files"| Diff{"Pending Migrations?"}
+    Diff -->|"Yes"| Exec["Run 'up' inside transaction & insert row into pgmigrations"]
+    Diff -->|"No"| NoOp["Report: No migrations to run"]
+    Exec -->|"Record completed file"| TrackingTable
+```
+
+In pgAdmin or psql, inspect the contents of `pgmigrations`:
+
+```sql
+SELECT id, name, run_on FROM pgmigrations;
+```
+
+##### Sample `pgmigrations` Data
+
+| id | name | run_on |
+| :--- | :--- | :--- |
+| `1` | `1604505000000_table-comments` | `2026-11-21 14:45:00.123+00` |
+
+If you immediately re-run `npm run migrate up`, the runner queries `pgmigrations`, verifies that `1604505000000_table-comments.js` has already been applied, and outputs:
+
+```text
+No migrations to run!
+```
+
+#### Rolling Back a Migration (`down`)
+
+To undo the most recent migration, execute `npm run migrate down` using the same `DATABASE_URL`:
+
+```bash
+# Revert the most recently applied migration
+DATABASE_URL=postgres://pushkar:password@localhost:5432/social_network npm run migrate down
+```
+
+##### Expected Output Sample (Reverting Migrations)
+
+```text
+> practice@1.0.0 migrate
+> node-pg-migrate down
+
+### MIGRATION 1604505000000_table-comments.js (DOWN) ###
+DROP TABLE comments;
+
+Migrations complete!
+```
+
+Upon executing `down`:
+1. The migration runner runs the `exports.down` function, executing `DROP TABLE comments;`.
+2. The runner deletes the corresponding record from `pgmigrations`.
+3. If verified in pgAdmin, the `comments` table is deleted, while `pgmigrations` is now empty.
+
+### Sequential Migrations and Schema Evolution
+
+In iterative software development, schemas evolve through a series of incremental migration files rather than modifying existing migration files that have already been applied to production.
+
+> [!CAUTION]
+> Never edit or delete an existing migration file that has already been deployed to production or shared with teammates. Doing so causes checksum and history mismatches against the `pgmigrations` tracking table. Always create a new sequential migration file to introduce further schema changes.
+
+#### Creating the Second Migration
+
+To resolve the naming issue from our initial scenario, generate a second migration to rename `contents` to `body`:
+
+```bash
+# Generate the rename migration
+npm run migrate create rename contents to body
+```
+
+##### Expected Output Sample
+
+```text
+Created migration -- /Users/pushkar/Desktop/practice/migrations/1604505999999_rename-contents-to-body.js
+```
+
+#### Authoring the Rename Migration
+
+Open `migrations/1604505999999_rename-contents-to-body.js` and implement `up` and `down`:
+
+```javascript
+/* eslint camelcase: 0 */
+
+exports.shorthands = undefined;
+
+/**
+ * Rename contents column to body
+ * @param {import('node-pg-migrate').MigrationBuilder} pgm
+ */
+exports.up = (pgm) => {
+  pgm.sql(`
+    ALTER TABLE comments
+    RENAME COLUMN contents TO body;
+  `);
+};
+
+/**
+ * Revert body column back to contents
+ * @param {import('node-pg-migrate').MigrationBuilder} pgm
+ */
+exports.down = (pgm) => {
+  pgm.sql(`
+    ALTER TABLE comments
+    RENAME COLUMN body TO contents;
+  `);
+};
+```
+
+#### Applying the Second Migration
+
+Ensure the initial migration is applied, then run `npm run migrate up`:
+
+```bash
+DATABASE_URL=postgres://pushkar:password@localhost:5432/social_network npm run migrate up
+```
+
+##### Expected Output Sample
+
+```text
+> Migrating files:
+> - 1604505999999_rename-contents-to-body.js
+### MIGRATION 1604505999999_rename-contents-to-body.js (UP) ###
+ALTER TABLE comments
+    RENAME COLUMN contents TO body;
+
+Migrations complete!
+```
+
+`node-pg-migrate` identifies that `1604505000000_table-comments.js` was already recorded in `pgmigrations`, skips it, and executes only `1604505999999_rename-contents-to-body.js`.
+
+Querying `pgmigrations` now shows both steps:
+
+```sql
+SELECT id, name, run_on FROM pgmigrations ORDER BY id ASC;
+```
+
+| id | name | run_on |
+| :--- | :--- | :--- |
+| `1` | `1604505000000_table-comments` | `2026-11-21 14:45:00.123+00` |
+| `2` | `1604505999999_rename-contents-to-body` | `2026-11-21 14:52:10.456+00` |
+
+#### Granular Single-Step Rollback
+
+If you execute `npm run migrate down`:
+- Only the latest migration (Migration 2) is reverted (`body` is renamed back to `contents`).
+- The `comments` table itself remains intact because Migration 1 was not reverted.
+- Running `npm run migrate up` reapplies Migration 2, returning `contents` to `body`.
+
+#### Advanced Production Considerations
+
+While schema migrations reliably automate structural changes, production systems require additional strategies for complex operations:
+- **Data Migrations & Data Massaging:** When splitting or merging columns (e.g., combining `first_name` and `last_name` into `full_name`) or altering column types, raw schema changes must be accompanied by data transformation queries (`UPDATE ... SET ...`).
+- **Zero-Downtime Deployments:** Renaming or removing active columns directly in production can still cause momentary errors if old web server instances are running during the deployment. Production systems use multi-phase deployment patterns (e.g., add new column -> dual-write -> backfill data -> update reads -> remove old column) to achieve zero downtime.
+
+### Plain SQL Migrations Without a Library
+
+While migration libraries like `node-pg-migrate` provide convenient CLIs and automated configuration, understanding how to run migrations using plain `.sql` files with standard PostgreSQL tooling (`psql`) clarifies the underlying mechanics.
+
+#### File Structure and Naming Conventions
+
+Without a library, migration files are typically stored in a `./migrations/` directory using paired `.up.sql` and `.down.sql` files prefixed with zero-padded sequence numbers or timestamps:
+
+```text
+migrations/
+├── 001_create_comments.up.sql
+├── 001_create_comments.down.sql
+├── 002_rename_contents_to_body.up.sql
+└── 002_rename_contents_to_body.down.sql
+```
+
+#### The Up and Down File Anatomy
+
+Each file contains raw SQL statements wrapped inside an explicit database transaction (`BEGIN ... COMMIT`) to ensure that if any statement fails, the entire operation rolls back atomically.
+
+##### `001_create_comments.up.sql`
+
+```sql
+BEGIN;
+
+CREATE TABLE IF NOT EXISTS comments (
+  id SERIAL PRIMARY KEY,
+  created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+  updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+  contents VARCHAR(240) NOT NULL
+);
+
+-- Record that this migration was applied
+INSERT INTO schema_migrations (version) VALUES ('001_create_comments');
+
+COMMIT;
+```
+
+##### `001_create_comments.down.sql`
+
+```sql
+BEGIN;
+
+DROP TABLE IF EXISTS comments;
+
+-- Remove the record of this migration
+DELETE FROM schema_migrations WHERE version = '001_create_comments';
+
+COMMIT;
+```
+
+#### The Execution Workflow
+
+Without a third-party package, the workflow relies on a custom shell script or continuous deployment (CI/CD) step using PostgreSQL's native `psql` command-line utility.
+
+```text
++---------------------------------------------------------------------------------+
+|                        PLAIN SQL MIGRATION WORKFLOW                             |
++---------------------------------------------------------------------------------+
+|                                                                                 |
+|  1. Bootstrap Tracking Table (One-time setup)                                   |
+|     CREATE TABLE IF NOT EXISTS schema_migrations (                              |
+|       version VARCHAR(255) PRIMARY KEY,                                         |
+|       applied_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP                          |
+|     );                                                                          |
+|                                                                                 |
+|  2. Apply Pending Migrations (Up Workflow)                                      |
+|     For each *.up.sql file sorted by filename:                                  |
+|     - Check: SELECT version FROM schema_migrations WHERE version = '001_...';   |
+|     - If missing: Execute via psql (applies DDL + inserts version row).         |
+|     - If present: Skip file.                                                    |
+|                                                                                 |
+|  3. Revert Latest Migration (Down Workflow)                                     |
+|     - Query: SELECT version FROM schema_migrations ORDER BY applied_at DESC     |
+|              LIMIT 1;                                                           |
+|     - Execute matching <version>.down.sql via psql.                             |
+|                                                                                 |
++---------------------------------------------------------------------------------+
+```
+
+##### Minimal Bash Runner Example (`migrate.sh`)
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+DATABASE_URL="${DATABASE_URL:-postgres://localhost:5432/social_network}"
+
+# Step 1: Ensure tracking table exists
+psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -c "
+  CREATE TABLE IF NOT EXISTS schema_migrations (
+    version VARCHAR(255) PRIMARY KEY,
+    applied_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+  );
+"
+
+# Step 2: Apply pending up migrations in alphabetical/numerical order
+for file in migrations/*.up.sql; do
+  version=$(basename "$file" .up.sql)
+  
+  # Check if migration has already been executed
+  already_run=$(psql "$DATABASE_URL" -t -A -c "SELECT COUNT(*) FROM schema_migrations WHERE version = '$version';")
+  
+  if [ "$already_run" -eq "0" ]; then
+    echo "Applying: $file"
+    psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f "$file"
+  else
+    echo "Skipping already applied: $version"
+  fi
+done
+```
+
+#### Trade-Off Analysis: Plain SQL vs. Migration Libraries
+
+| Consideration | Plain SQL Scripts (`psql` + Bash) | Dedicated Library (`node-pg-migrate`) |
+| :--- | :--- | :--- |
+| **Dependencies** | Zero application dependencies; requires only `psql`. | Requires runtime dependencies (Node.js, `pg`, library package). |
+| **Concurrency / Advisory Locks** | Manual; risks race conditions if two deployment pods migrate simultaneously. | Built-in PostgreSQL advisory locks prevent concurrent execution clashes. |
+| **Cross-Platform Portability** | Relies on Bash/sh environments; difficult to run reliably across Windows/macOS/Linux. | Platform-agnostic JavaScript CLI executed consistently via `npm run migrate`. |
+| **Developer Ergonomics** | Must manually manage tracking tables, rollback lookups, and transaction boundaries. | Automated file generation (`migrate create`), single-command rollbacks (`migrate down`), and status tracking. |
+
+---
+
+### Interactive Knowledge Check Quiz
+
+<details>
+<summary><b>Question 1: Why did renaming a column directly on the production database cause an immediate application outage, even though the SQL executed without errors?</b></summary><br>
+<b>Answer:</b> Live production backend servers were still executing previous application code that queried the old column name (<code>SELECT contents FROM comments</code>). When the database column was renamed to <code>body</code> without simultaneously deploying updated application code, incoming queries failed immediately, causing 500 Internal Server Errors for active users.
+</details>
+
+<details>
+<summary><b>Question 2: What is the primary operational difference between the <code>up</code> and <code>down</code> functions in a schema migration file?</b></summary><br>
+<b>Answer:</b> The <code>up</code> function applies structural modifications to advance the database schema to a newer state (e.g., creating a table or renaming a column), whereas the <code>down</code> function contains the exact inverse operations to cleanly revert those changes back to the previous state.
+</details>
+
+<details>
+<summary><b>Question 3: How does <code>node-pg-migrate</code> know which migrations have already been executed on a database and which ones are pending?</b></summary><br>
+<b>Answer:</b> It maintains a dedicated tracking table inside the target PostgreSQL database named <code>pgmigrations</code>. Every time a migration's <code>up</code> function succeeds, its filename and execution timestamp are recorded in this table. On subsequent runs, the runner compares files on disk with rows in <code>pgmigrations</code> and only executes unrecorded files.
+</details>
+
+<details>
+<summary><b>Question 4: If you have already applied a migration to a shared staging or production database and realize you made a syntax or naming mistake, why should you NOT edit the existing migration file?</b></summary><br>
+<b>Answer:</b> The migration runner tracks applied migrations by filename and records them in <code>pgmigrations</code>. Editing an already-executed migration will not re-run it on existing databases (the runner sees it as already executed). Furthermore, it causes schema drift and inconsistency between existing databases and new environments. The correct approach is to create a new sequential migration file that applies the fix.
 </details>
