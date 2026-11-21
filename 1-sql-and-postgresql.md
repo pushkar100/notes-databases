@@ -102,6 +102,7 @@
    * [Database Transactions](#database-transactions)
    * [Database Schema Migrations in Practice](#database-schema-migrations-in-practice)
    * [Schema vs Data Migrations and Having a Plan](#schema-vs-data-migrations-and-having-a-plan)
+   * [Full-Stack Database Integration: Architecture, Pooling, and Route Scaffolding](#full-stack-database-integration-architecture-pooling-and-route-scaffolding)
 
 
 <!-- TOC end -->
@@ -8586,4 +8587,566 @@ SELECT * FROM posts;
 <summary><b>Question 5: How does the pg Node.js driver represent PostgreSQL POINT data types in JavaScript?</b></summary>
 <br>
 <b>Answer:</b> The <code>pg</code> driver automatically parses a PostgreSQL <code>POINT</code> column into a JavaScript object with <code>x</code> and <code>y</code> numeric properties: <code>{ x: longitude, y: latitude }</code>. In application code, coordinates are accessed using <code>row.loc.x</code> and <code>row.loc.y</code>.
+</details>
+
+
+## Full-Stack Database Integration: Architecture, Pooling, and Route Scaffolding
+
+### Architectural Overview and Project Scope
+
+When integrating a relational database like PostgreSQL with a backend application, software engineers must make deliberate architectural decisions regarding connection lifecycle, environment isolation, and testability. Rather than using high-level Object-Relational Mappers (ORMs) that obscure underlying database operations, this architecture focuses on low-level interactions using the standard `pg` (node-postgres) driver, manual schema migrations via `node-pg-migrate`, and a modular Express.js web server.
+
+The application serves a social networking resource model centered on a `users` table. The core objective is not simply handling HTTP requests, but establishing robust patterns for:
+1. Managing database schema evolution predictably via migration scripts.
+2. Decoupling HTTP server definition from network listener binding to enable automated testing.
+3. Managing concurrent database traffic efficiently through connection pooling.
+4. Implementing fail-fast startup routines that validate database reachability before the web server begins accepting traffic.
+
+```text
++---------------------------------------------------------------------------------------+
+|                               SYSTEM ARCHITECTURE OVERVIEW                            |
++---------------------------------------------------------------------------------------+
+|                                                                                       |
+|   +-------------------+          +------------------------------------------------+   |
+|   |    HTTP Client    |          |                 Node.js Backend                |   |
+|   | (Browser/Postman) |          |                                                |   |
+|   +---------+---------+          |   +----------------+     +-----------------+   |   |
+|             |                    |   |    index.js    | --> |   src/app.js    |   |   |
+|             | HTTP Request       |   | (Entry/Listen) |     | (App Factory)   |   |   |
+|             v                    |   +-------+--------+     +--------+--------+   |   |
+|   +-------------------+          |           |                       |            |   |
+|   | Express Server    |          |           | Validates DB          v            |   |
+|   | (Port 3005)       |          |           | on startup   +-----------------+   |   |
+|   +---------+---------+          |           |              | src/routes/     |   |   |
+|             |                    |           v              | users.js        |   |   |
+|             | Route Handling     |   +----------------+     +--------+--------+   |   |
+|             v                    |   |  src/pool.js   |              |            |   |
+|   +-------------------+          |   | (Pool Wrapper) | <------------+            |   |
+|   | Users Router      |          |   +-------+--------+   Sends Queries           |   |
+|   +---------+---------+          |           |                                    |   |
+|             |                    +-----------|------------------------------------+   |
+|             | SQL Query                      |                                        |
+|             v                                v TCP Socket Connection                  |
+|   +-------------------+          +------------------------------------------------+   |
+|   |  PostgreSQL DB    | <--------+  PostgreSQL Server: "social-network"           |   |
+|   |  (Port 5432)      |          |  Table: "users"                                |   |
+|   +-------------------+          +------------------------------------------------+   |
+|                                                                                       |
++---------------------------------------------------------------------------------------+
+```
+
+### Database Migration: Provisioning the Users Table
+
+Database migrations provide a structured, version-controlled mechanism to modify database schemas over time. Instead of executing arbitrary manual SQL queries in a GUI tool like pgAdmin, migrations are defined in code and tracked in a dedicated database table (`pgmigrations`).
+
+#### Configuring NPM Scripts
+
+To automate schema execution and development server reloads, configure `package.json` with dedicated scripts for `node-pg-migrate` and `nodemon`:
+
+```json
+{
+  "name": "social-repo",
+  "version": "1.0.0",
+  "description": "Social Network REST API with PostgreSQL",
+  "main": "index.js",
+  "scripts": {
+    "start": "nodemon index.js",
+    "migrate": "node-pg-migrate"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "pg": "^8.11.3"
+  },
+  "devDependencies": {
+    "node-pg-migrate": "^6.2.2",
+    "nodemon": "^3.0.1"
+  }
+}
+```
+
+- `npm run start`: Runs `nodemon index.js`, automatically restarting the process when project files change.
+- `npm run migrate`: Delegates commands directly to the `node-pg-migrate` CLI.
+
+#### Generating the Migration
+
+Generate a new migration template from the terminal:
+
+```bash
+npm run migrate create add-users-table
+```
+
+Expected terminal output:
+```text
+> social-repo@1.0.0 migrate
+> node-pg-migrate create add-users-table
+
+Created migration -- migrations/1698000000000_add-users-table.js
+```
+
+#### Writing Up and Down Migration Scripts
+
+The generated file exports `up` and `down` functions. In `node-pg-migrate`, `pgm.sql()` executes raw SQL strings. The migration defines the structure of the `users` table:
+
+```javascript
+/* migrations/1698000000000_add-users-table.js */
+
+exports.up = (pgm) => {
+  // Define forward migration: create the users table
+  pgm.sql(`
+    CREATE TABLE users (
+      id SERIAL PRIMARY KEY,
+      created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+      bio VARCHAR(400),
+      username VARCHAR(30) NOT NULL
+    );
+  `);
+};
+
+exports.down = (pgm) => {
+  // Define rollback migration: cleanly drop the table
+  pgm.sql(`
+    DROP TABLE users;
+  `);
+};
+```
+
+#### Column Definitions and Engineering Rationale
+
+| Column Name | Data Type | Constraints / Defaults | Engineering Purpose |
+| :--- | :--- | :--- | :--- |
+| `id` | `SERIAL` | `PRIMARY KEY` | Auto-incrementing 4-byte integer acting as the unique identifier for each user record. |
+| `created_at` | `TIMESTAMPTZ` | `DEFAULT CURRENT_TIMESTAMP` | Records the exact time of record insertion with timezone offsets preserved. |
+| `updated_at` | `TIMESTAMPTZ` | `DEFAULT CURRENT_TIMESTAMP` | Tracks when the record was last modified. |
+| `bio` | `VARCHAR(400)` | Nullable | Stores an optional profile description, capped at 400 characters to prevent excessive row width. |
+| `username` | `VARCHAR(30)` | `NOT NULL` | The user's handle; mandatory field enforced by database constraints. |
+
+#### Executing the Migration Against a Fresh Database
+
+Before running migrations, establish a clean database environment:
+1. In pgAdmin, close any active query tool connections to the `social-network` database.
+2. Right-click `social-network` and select **Delete / Drop** to remove any old experimental state.
+3. Right-click **Databases**, select **Create Database**, and name it `social-network`.
+4. Execute the migration from your terminal by supplying the connection URL via the `DATABASE_URL` environment variable:
+
+```bash
+# For macOS / Linux (using local user authentication):
+DATABASE_URL=postgres://sg@localhost:5432/social-network npm run migrate up
+
+# For environments with password authentication (e.g., Windows default postgres user):
+DATABASE_URL=postgres://postgres:your_password@localhost:5432/social-network npm run migrate up
+```
+
+Expected terminal output:
+```text
+> social-repo@1.0.0 migrate
+> node-pg-migrate up
+
+> Applying migration 1698000000000_add-users-table
+### MIGRATION 1698000000000_add-users-table (UP) ###
+CREATE TABLE users (
+  id SERIAL PRIMARY KEY,
+  created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+  updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+  bio VARCHAR(400),
+  username VARCHAR(30) NOT NULL
+);
+
+Migrations complete!
+```
+
+### Application Architecture: Decoupling Express Setup from Server Listening
+
+In beginner tutorials, Express applications are often written in a single file where `app = express()` is configured and immediately followed by `app.listen(port)`. While simple, this creates major difficulties when writing automated integration tests.
+
+#### The Testing Dilemma: Port Collision vs. In-Memory Request Injection
+
+When running automated test suites (such as Jest or Supertest):
+- If `app.listen(3005)` executes as soon as the file is imported, running tests will bind to port 3005 on the host machine.
+- If multiple test files import the app simultaneously, subsequent test runners fail with `EADDRINUSE: address already in use :::3005`.
+- Supertest can inject HTTP requests directly into an Express app in memory without binding to any physical network port, but only if the app instance is decoupled from `app.listen()`.
+
+```text
++-----------------------------------------------------------------------------------+
+|               MONOLITHIC PATTERN vs. DECOUPLED FACTORY PATTERN                    |
++-----------------------------------------------------------------------------------+
+|                                                                                   |
+|  TRADITIONAL MONOLITH (Tight Coupling)                                            |
+|  +-----------------------------------------------------------------------------+  |
+|  | app.js: const app = express(); ... app.listen(3005);                        |  |
+|  +-----------------------------------------------------------------------------+  |
+|      |                                                                            |
+|      +--> Problem: Cannot import 'app' in tests without opening port 3005.        |
+|      +--> Multiple test files crash with EADDRINUSE errors.                       |
+|                                                                                   |
+|  DECOUPLED FACTORY PATTERN (High Testability)                                     |
+|  +-------------------------------------+     +---------------------------------+  |
+|  | src/app.js                          |     | index.js (Production Entry)     |  |
+|  | Exports a factory function:         | <-- | Imports factory, calls app(),   |  |
+|  | module.exports = () => { ... }      |     | and binds app.listen(3005).     |  |
+|  +-------------------------------------+     +---------------------------------+  |
+|                  ^                                                                |
+|                  |                           +---------------------------------+  |
+|                  +-------------------------- | tests/users.test.js (Test Suite)|  |
+|                                              | Imports factory, passes to      |  |
+|                                              | supertest(app()) in memory.     |  |
+|                                              +---------------------------------+  |
+|                                                                                   |
++-----------------------------------------------------------------------------------+
+```
+
+#### Implementing the App Factory
+
+Create `src/app.js` and export a function that instantiates, configures, and returns an Express application instance:
+
+```javascript
+/* src/app.js */
+const express = require('express');
+const usersRouter = require('./routes/users');
+
+module.exports = () => {
+  const app = express();
+
+  // Middleware to parse incoming JSON payloads into req.body
+  app.use(express.json());
+
+  // Mount the modular users router
+  app.use(usersRouter);
+
+  return app;
+};
+```
+
+### RESTful Routing: Scaffolding the Users Router
+
+To maintain clean code separation, individual HTTP routes should not be piled into `app.js`. Express provides `express.Router()` to package routes for a specific resource into an isolated module.
+
+#### Standard RESTful Endpoints for the Users Resource
+
+The `users` resource implements conventional REST verbs and endpoint structures:
+
+| HTTP Method | Route Endpoint | Purpose / Goal | Expected Status Codes |
+| :--- | :--- | :--- | :--- |
+| `GET` | `/users` | Retrieve a list of all users | `200 OK` |
+| `GET` | `/users/:id` | Retrieve a single user record by ID | `200 OK`, `404 Not Found` |
+| `POST` | `/users` | Create a new user record | `201 Created`, `400 Bad Request` |
+| `PUT` | `/users/:id` | Update an existing user record by ID | `200 OK`, `404 Not Found` |
+| `DELETE` | `/users/:id` | Remove a user record by ID | `200 OK`, `404 Not Found` |
+
+#### Implementing the Router Scaffolding
+
+Create `src/routes/users.js` with placeholders for each endpoint:
+
+```javascript
+/* src/routes/users.js */
+const express = require('express');
+
+// Create an isolated router instance
+const router = express.Router();
+
+// List all users
+router.get('/users', async (req, res) => {
+  // Query to fetch all users will be implemented here
+});
+
+// Fetch single user by ID
+router.get('/users/:id', async (req, res) => {
+  const { id } = req.params;
+  // Query to fetch user by id will be implemented here
+});
+
+// Create new user
+router.post('/users', async (req, res) => {
+  const { username, bio } = req.body;
+  // Query to insert user will be implemented here
+});
+
+// Update existing user
+router.put('/users/:id', async (req, res) => {
+  const { id } = req.params;
+  const { username, bio } = req.body;
+  // Query to update user will be implemented here
+});
+
+// Delete user
+router.delete('/users/:id', async (req, res) => {
+  const { id } = req.params;
+  // Query to delete user will be implemented here
+});
+
+// Export the router to be consumed by app.js
+module.exports = router;
+```
+
+### PostgreSQL Driver Mechanics: Single Client vs. Connection Pool
+
+The official `pg` (node-postgres) library is a low-level driver. It does not validate SQL syntax, build query abstracts, or manage data relationships—its sole job is establishing TCP connections to PostgreSQL, transmitting SQL query strings, and parsing the returned binary protocol.
+
+When connecting to PostgreSQL from Node.js, developers can create a `Client` or a `Pool`. Understanding the trade-offs between them is essential for any production backend.
+
+```text
++-----------------------------------------------------------------------------------+
+|                       CLIENT vs. CONNECTION POOL MECHANICS                        |
++-----------------------------------------------------------------------------------+
+|                                                                                   |
+|  SINGLE CLIENT (Sequential Bottleneck)                                            |
+|                                                                                   |
+|  Request 1 ---\                                                                   |
+|  Request 2 -----+--> [ Single Client (1 Socket) ] ===> [ PostgreSQL Server ]      |
+|  Request 3 ---/            (Blocks!)                                              |
+|                                                                                   |
+|  * Executes only 1 query at a time. All concurrent requests wait in a queue.      |
+|  * Only suitable for explicit database transactions (BEGIN ... COMMIT).           |
+|                                                                                   |
+| --------------------------------------------------------------------------------- |
+|                                                                                   |
+|  CONNECTION POOL (Concurrent Throughput)                                          |
+|                                                                                   |
+|  Request 1 --------> [ Client 1 Socket ] ============> [ PostgreSQL Server ]      |
+|  Request 2 --------> [ Client 2 Socket ] ============> [ PostgreSQL Server ]      |
+|  Request 3 --------> [ Client 3 Socket ] ============> [ PostgreSQL Server ]      |
+|                            ^                                                      |
+|                            | Managed automatically                                |
+|                     [ Pool Manager ]                                              |
+|                                                                                   |
+|  * Maintains an internal cache of warm, reusable client connections.             |
+|  * Automatically checks out an idle client, runs the query, and reclaims it.     |
+|                                                                                   |
++-----------------------------------------------------------------------------------+
+```
+
+#### Detailed Comparison: Client vs. Pool
+
+| Characteristic | `pg.Client` | `pg.Pool` |
+| :--- | :--- | :--- |
+| **Connection Count** | Exactly one active TCP socket connection. | Manages a configurable pool of multiple connections (default: 10). |
+| **Concurrency Support** | Strictly sequential; cannot execute concurrent queries. | Highly concurrent; routes parallel queries to available idle clients. |
+| **Overhead** | High if created per-request (TCP handshake + TLS + Postgres auth). | Low; connections are kept open and reused across multiple HTTP requests. |
+| **Primary Use Case** | Multi-step database transactions (`BEGIN`, `SAVEPOINT`, `COMMIT`). | General application queries, web APIs, and standard repository methods. |
+
+> [!IMPORTANT]
+> A single `pg.Client` cannot process queries in parallel. If an API uses a single `Client` instance, 50 simultaneous web requests will queue up sequentially. Always use a `Pool` for web servers.
+
+### The Testability Wrapper: Encapsulating the Connection Pool
+
+Most Node.js documentation demonstrates connection pools like this:
+
+```javascript
+// Conventional pattern found in blog posts and docs:
+const { Pool } = require('pg');
+module.exports = new Pool({
+  host: 'localhost',
+  port: 5432,
+  database: 'social-network'
+});
+```
+
+#### Why the Conventional Pattern Breaks Automated Testing
+
+In enterprise applications and comprehensive test suites, tests must run against dedicated, isolated test databases (e.g., `social-network-test`) rather than the development database (`social-network`). 
+
+If a pool is instantiated and exported directly as a singleton at the top level of a module:
+- The configuration is evaluated once when the module is first required.
+- The application cannot change its database connection parameters dynamically during test execution.
+- Switching databases between integration test suites becomes nearly impossible without restarting the entire Node.js runtime process.
+
+#### Implementing the Dynamic Pool Wrapper
+
+To solve this, encapsulate the connection pool inside a class that manages the underlying `pg.Pool` instance dynamically:
+
+```javascript
+/* src/pool.js */
+const pg = require('pg');
+
+class Pool {
+  // Internal reference to the underlying node-postgres Pool instance
+  _pool = null;
+
+  /**
+   * Initializes or re-initializes the connection pool with provided options.
+   * Forces an immediate query to validate network and credential health.
+   */
+  connect(options) {
+    this._pool = new pg.Pool(options);
+    // Execute a lightweight query to force an immediate TCP connection test
+    return this._pool.query('SELECT 1 + 1;');
+  }
+
+  /**
+   * Gracefully tears down all active socket connections in the pool.
+   * Essential for test suite cleanup and graceful application termination.
+   */
+  close() {
+    return this._pool.end();
+  }
+
+  /**
+   * Proxies SQL query execution directly to the active internal pool.
+   * @param {string} sql - The raw SQL statement.
+   * @param {Array} params - Optional parameterized query values.
+   */
+  query(sql, params) {
+    return this._pool.query(sql, params);
+  }
+}
+
+// Export a single instance of our wrapper class
+module.exports = new Pool();
+```
+
+### Startup Validation and the Lazy Connection Trap
+
+One of the most surprising behaviors of `node-postgres` for newer engineers is **lazy connection establishment**.
+
+#### The Lazy Connection Trap Explained
+
+When you instantiate `new pg.Pool(options)`, **no network connection to PostgreSQL is opened**. The constructor merely creates an internal JavaScript data structure in memory. It does not attempt to:
+- Resolve the database host DNS.
+- Connect over TCP on port 5432.
+- Perform the PostgreSQL authentication handshake.
+- Verify that the specified database name actually exists.
+
+If an application boots up, starts listening on port 3005, and only attempts to connect when the first user request arrives, misconfigurations (such as an incorrect password or invalid database name) will remain hidden until that first request crashes with a database error.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant Node as index.js (Process)
+    participant Pool as src/pool.js (Wrapper)
+    participant PG as PostgreSQL Server (5432)
+    participant App as src/app.js (Express)
+
+    Node->>Pool: pool.connect(options)
+    Note over Pool: Instantiates internal new pg.Pool() [Lazy]
+    Pool->>PG: SELECT 1 + 1; (Validation Probe Query)
+    alt Credentials and Network Valid
+        PG-->>Pool: Result: 2 (Connection Verified)
+        Pool-->>Node: Promise.resolve()
+        Node->>App: app().listen(3005)
+        Note over Node: Server successfully listening on port 3005
+    else Invalid Credentials or Host Unreachable
+        PG-->>Pool: Connection Refused / Auth Error
+        Pool-->>Node: Promise.reject(err)
+        Note over Node: Logs error to console and process halts
+    end
+```
+
+#### Implementing the Fail-Fast Entry Point
+
+By returning `this._pool.query('SELECT 1 + 1;')` inside `connect()`, the pool is forced to immediately check out a client, open a physical TCP connection, complete the authentication handshake, and verify the connection.
+
+Create `index.js` in the project root to coordinate this fail-fast startup sequence:
+
+```javascript
+/* index.js */
+const createApp = require('./src/app');
+const pool = require('./src/pool');
+
+// Attempt to connect to the database before opening the web server
+pool
+  .connect({
+    host: 'localhost',
+    port: 5432,
+    database: 'social-network',
+    user: 'sg', // Replace with your PostgreSQL user (e.g., 'postgres')
+    password: '', // Replace with your database password
+  })
+  .then(() => {
+    // Database connection verified; start listening for HTTP traffic
+    const app = createApp();
+    app.listen(3005, () => {
+      console.log('Listening on port 3005');
+    });
+  })
+  .catch((err) => {
+    // Database connection failed; halt startup and log the error
+    console.error('Fatal Database Connection Error:', err.message);
+  });
+```
+
+#### Verifying Startup Behaviors
+
+**1. Successful Startup Test:**
+Run the application with valid credentials:
+```bash
+node index.js
+```
+Expected output:
+```text
+Listening on port 3005
+```
+
+**2. Intentional Failure Test (Demonstrating Fail-Fast Safety):**
+Temporarily change `host: 'localhost'` to `host: 'invalid-db-hostname'` in `index.js` and run the script:
+```bash
+node index.js
+```
+Expected output:
+```text
+Fatal Database Connection Error: getaddrinfo ENOTFOUND invalid-db-hostname
+```
+The application logs the specific connection failure and exits cleanly back to the shell without opening port 3005 or creating a zombie server.
+
+### Lifecycle Management: Implementing Query Delegation and Teardown
+
+Managing resources properly requires both delegating queries cleanly and providing mechanisms to release connections when tearing down servers or finishing test runs.
+
+#### The `close()` Method
+
+The `close()` method delegates directly to `this._pool.end()`:
+
+```javascript
+close() {
+  return this._pool.end();
+}
+```
+
+- When `this._pool.end()` is invoked, the pool stops accepting new query requests.
+- It waits for currently active queries to complete.
+- It sends termination packets across all open sockets and gracefully closes all client TCP connections.
+- In test runners like Jest, failing to call `close()` leaves open network sockets active, causing test runners to hang with the warning: `Jest has detected the following 1 open handle potentially keeping Jest from exiting`.
+
+#### The `query()` Method and Future Security Considerations
+
+The `query()` method provides the primary gateway through which application routers and repositories interact with PostgreSQL:
+
+```javascript
+query(sql, params) {
+  return this._pool.query(sql, params);
+}
+```
+
+> [!CAUTION]
+> Directly executing unparameterized query strings built with string concatenation (e.g., `pool.query("SELECT * FROM users WHERE id = " + req.params.id)`) exposes the system to severe **SQL Injection** vulnerabilities. Production applications must always pass parameterized queries (`pool.query('SELECT * FROM users WHERE id = $1;', [id])`) to ensure user input is treated strictly as data rather than executable SQL commands.
+
+### Interactive Knowledge Check Quiz
+
+<details>
+<summary><b>Question 1: Why does direct instantiation of a pool (e.g., module.exports = new Pool()) hinder automated test suites?</b></summary>
+<br>
+<b>Answer:</b> Direct instantiation eagerly binds database configuration options at module load time. Automated test suites often require dynamic connection switching (for instance, redirecting each test suite to an isolated, temporary test database). Encapsulating the pool in a wrapper class allows tests to invoke <code>pool.connect(testConfig)</code> and <code>pool.close()</code> dynamically without restarting the Node.js process.
+</details>
+
+<details>
+<summary><b>Question 2: What is the "lazy connection trap" in node-postgres, and how does SELECT 1 + 1 resolve it?</b></summary>
+<br>
+<b>Answer:</b> Instantiating <code>new pg.Pool()</code> only creates an in-memory JavaScript configuration object; it does not open a network socket or authenticate with PostgreSQL. If database credentials or hostnames are invalid, no error is thrown until the first query executes. Running <code>SELECT 1 + 1;</code> immediately forces the pool to check out a client, open a physical TCP socket, and complete the authentication handshake, allowing the server to fail fast before accepting web traffic.
+</details>
+
+<details>
+<summary><b>Question 3: Why should a web API use a connection pool instead of a single pg.Client instance?</b></summary>
+<br>
+<b>Answer:</b> A single <code>pg.Client</code> instance can only execute one query at a time over its single socket connection. If multiple HTTP requests hit the API simultaneously, they must queue and execute sequentially, causing severe latency bottlenecks. A <code>Pool</code> maintains multiple reusable client connections and automatically delegates concurrent queries to idle clients in parallel.
+</details>
+
+<details>
+<summary><b>Question 4: Why should app creation (app = express()) be decoupled from server listening (app.listen())?</b></summary>
+<br>
+<b>Answer:</b> Decoupling the app factory from <code>app.listen()</code> allows testing libraries like Supertest to import the app and inject mock HTTP requests in memory without binding to a physical TCP port. This avoids <code>EADDRINUSE</code> port collision errors when running parallel integration tests across multiple test files.
+</details>
+
+<details>
+<summary><b>Question 5: What problem occurs during test teardown if pool.close() (calling pool.end()) is omitted?</b></summary>
+<br>
+<b>Answer:</b> If <code>pool.end()</code> is not called, the pool keeps its open client TCP sockets alive in the Node.js event loop. Test runners like Jest will detect these dangling open handles and hang indefinitely instead of exiting cleanly after tests complete.
 </details>
