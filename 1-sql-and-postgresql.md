@@ -99,6 +99,7 @@
    * [Recursive Common Table Expressions (CTEs)](#recursive-common-table-expressions-ctes)
    * [Simplifying Queries with Views](#simplifying-queries-with-views)
    * [Materialized Views and Query Caching](#materialized-views-and-query-caching)
+   * [Database Transactions](#database-transactions)
 
 
 <!-- TOC end -->
@@ -6603,3 +6604,431 @@ Weekly like aggregations are an ideal use case:
 <details><summary><b>Question 3: What does the WITH DATA clause do when creating a materialized view?</b></summary><br><b>Answer:</b> <code>WITH DATA</code> tells PostgreSQL to execute the query immediately upon creation and populate the materialized view with data so it is ready to be queried.</details>
 
 <details><summary><b>Question 4: What happens to a materialized view when underlying records are deleted, and how do you fix it?</b></summary><br><b>Answer:</b> The materialized view does not automatically update; it continues to serve the old saved results (stale data). To synchronize it with the base tables, you must run <code>REFRESH MATERIALIZED VIEW [view_name];</code> to re-run the query and update the saved data.</details>
+
+## Database Transactions
+
+### The Motivation: Preventing Partial Failures in Multi-Step Workflows
+
+In real-world software engineering, business operations rarely map to a single, isolated SQL query. Instead, a meaningful user action often requires several coordinated database updates. When operations are split across multiple queries, application crashes, network interruptions, or server errors can leave the database in an inconsistent, broken state.
+
+#### The Bank Transfer Dilemma
+
+Consider the classic banking scenario: transferring \$50 from Allison's bank account to Jia's bank account.
+
+In physical reality, Allison simply hands \$50 to Jia. In a database, there is no single physical hand-off command. Instead, the backend system must execute two distinct steps:
+
+1. Deduct \$50 from Allison's account balance.
+2. Add \$50 to Jia's account balance.
+
+```sql
+-- Step 1: Withdraw $50 from Allison
+UPDATE accounts
+SET balance = balance - 50
+WHERE name = 'Allison';
+
+-- [CRASH POINT: Application server crashes, network drops, or power fails]
+
+-- Step 2: Deposit $50 into Jia's account
+UPDATE accounts
+SET balance = balance + 50
+WHERE name = 'Jia';
+```
+
+If the application server running on AWS, DigitalOcean, or a local machine crashes between Step 1 and Step 2, Allison loses \$50, but Jia never receives it. When the application server restarts, it typically has no built-in knowledge of half-executed operations. The missing \$50 vanishes into thin air with no audit trail or recovery mechanism.
+
+#### The All-or-Nothing Guarantee
+
+Database transactions exist to solve this exact partial-failure problem. A transaction bundles multiple SQL statements into a single logical unit of work that guarantees:
+
+- **All statements execute completely**, or
+- **None of the statements execute at all**.
+
+If any unexpected interruption occurs halfway through, the database automatically rolls back every partial change, leaving data in its clean, pre-transaction state.
+
+---
+
+### Setting Up Sample Data: The Accounts Table
+
+To inspect transaction behavior hands-on, create a standalone `accounts` table with sample balances.
+
+#### Schema Definition
+
+The table tracks an account owner's name and their integer balance:
+
+```sql
+-- Create the accounts table
+CREATE TABLE accounts (
+    id SERIAL PRIMARY KEY,
+    name VARCHAR(20) NOT NULL,
+    balance INTEGER NOT NULL
+);
+```
+
+> [!TIP]
+> In production applications, balance columns often include constraints (such as `CHECK (balance >= 0)`) or defaults (such as `DEFAULT 0`) to prevent overdraft states.
+
+#### Seeding Account Balances
+
+Insert two baseline records, giving both Allison and Jia a starting balance of \$100:
+
+```sql
+-- Insert seed data for Allison and Jia
+INSERT INTO accounts (name, balance)
+VALUES
+    ('Jia', 100),
+    ('Allison', 100);
+
+-- Verify the seeded rows
+SELECT * FROM accounts;
+```
+
+**Expected Output Sample:**
+
+```text
+ id |  name   | balance
+----+---------+---------
+  1 | Jia     |     100
+  2 | Allison |     100
+(2 rows)
+```
+
+---
+
+### Architecture & Mental Model: Connections and Workspaces
+
+Understanding transactions requires understanding how client applications communicate with PostgreSQL.
+
+#### Understanding Database Connections
+
+Whenever an application, backend service, or graphical tool (such as pgAdmin or DBeaver) interacts with PostgreSQL, it establishes an independent **connection** (a dedicated network session).
+
+- In pgAdmin, opening a new Query Tool window creates a separate, independent connection.
+- If you open two Query Tool windows, you are managing Connection 1 and Connection 2 concurrently.
+- Under normal conditions, every connection queries the **main data pool**—the shared, committed state of tables and rows stored in the database.
+
+#### The Isolated Workspace Mental Model
+
+When a client executes `BEGIN;`, PostgreSQL creates an isolated logical workspace dedicated solely to that connection.
+
+- **Private visibility:** Any modifications (`UPDATE`, `INSERT`, `DELETE`) executed inside the transaction apply exclusively to this isolated workspace.
+- **Zero data duplication:** Behind the scenes, PostgreSQL does not physically duplicate entire tables or rows. The "separate workspace" is a conceptual mental model representing transaction isolation.
+- **Concurrent privacy:** Other database connections continue to read from the main data pool and remain completely unaware of uncommitted modifications.
+
+#### Architectural Mental Model (ASCII Diagram)
+
+```text
++-------------------------------------------------------------------------+
+|                           PostgreSQL Server                             |
+|                                                                         |
+|   +-----------------------------------------------------------------+   |
+|   |                       Main Data Pool                            |   |
+|   |   Table: accounts                                               |   |
+|   |   +----+---------+---------+                                    |   |
+|   |   | id | name    | balance |                                    |   |
+|   |   +----+---------+---------+                                    |   |
+|   |   | 1  | Jia     | 100     |                                    |   |
+|   |   | 2  | Allison | 100     |                                    |   |
+|   |   +----+---------+---------+                                    |   |
+|   +-----------------------------------------------------------------+   |
+|           ^                                           ^                 |
+|           | (Reads committed data:                    | (Reads & writes |
+|           |  Allison=100, Jia=100)                    |  committed data)|
+|           |                                           |                 |
+|   +---------------+                   +-------------------------------+ |
+|   | Connection 2  |                   |         Connection 1          | |
+|   | (Query Window)|                   |  [BEGIN - Transaction Active] | |
+|   +---------------+                   +-------------------------------+ |
+|                                                       |                 |
+|                                                       v                 |
+|                                       +-------------------------------+ |
+|                                       |     Isolated Workspace        | |
+|                                       | (Uncommitted Changes)         | |
+|                                       | Allison: 100 -> 50            | |
+|                                       | Jia:     100 -> 150           | |
+|                                       +-------------------------------+ |
+|                                           |                   |         |
+|                                  [COMMIT] |        [ROLLBACK] |         |
+|                                           v                   v         |
+|                                     Merge changes      Discard changes  |
++-------------------------------------------------------------------------+
+```
+
+#### Transaction Lifecycle & Termination Paths (Mermaid Flowchart)
+
+```mermaid
+flowchart TD
+    A["1. BEGIN (Open Workspace)"] --> B["2. Run SQL Statements"]
+    B --> C{"How it Ends"}
+    C -->|"All Good"| D["COMMIT<br>(Saves to database)"]
+    C -->|"Cancel"| E["ROLLBACK<br>(Discards changes)"]
+    C -->|"SQL Error"| F["Aborted State<br>(Run ROLLBACK to reset)"]
+    C -->|"Crash / Disconnect"| G["Automatic Cleanup<br>(Postgres discards changes)"]
+```
+
+---
+
+### Transaction Operations: Opening, Isolating, and Committing
+
+A transaction follows a structured lifecycle: starting with `BEGIN`, performing modifications, and concluding with `COMMIT` or `ROLLBACK`.
+
+#### Opening a Transaction with BEGIN
+
+To open a transaction block on the current connection, run `BEGIN`:
+
+```sql
+BEGIN;
+```
+
+**Interface State Indicators in pgAdmin:**
+
+- **Before running `BEGIN`:** The connection status bar shows an idle plug icon indicating `there is no current transaction`.
+- **After running `BEGIN`:** The icon switches to a clock badge with the status `session is idle in a valid transaction block`. This confirms the connection is operating inside an active transaction.
+
+#### Demonstrating Isolation Between Concurrent Connections
+
+To observe isolation in action, use two separate query windows (representing two independent client connections).
+
+**Step 1: Execute update in Connection 1 (inside transaction)**
+
+```sql
+-- Inside Connection 1:
+UPDATE accounts
+SET balance = balance - 50
+WHERE name = 'Allison';
+
+SELECT * FROM accounts;
+```
+
+**Expected Output (Connection 1):**
+
+```text
+ id |  name   | balance
+----+---------+---------
+  1 | Jia     |     100
+  2 | Allison |      50
+(2 rows)
+```
+
+**Step 2: Inspect accounts from Connection 2 (outside transaction)**
+
+```sql
+-- Inside Connection 2:
+SELECT * FROM accounts;
+```
+
+**Expected Output (Connection 2):**
+
+```text
+ id |  name   | balance
+----+---------+---------
+  1 | Jia     |     100
+  2 | Allison |     100
+(2 rows)
+```
+
+Notice the difference: Connection 1 sees Allison with \$50, while Connection 2 still sees Allison with \$100. Connection 2 is protected from viewing half-finished, uncommitted data.
+
+**Step 3: Complete the transfer in Connection 1**
+
+```sql
+-- Inside Connection 1:
+UPDATE accounts
+SET balance = balance + 50
+WHERE name = 'Jia';
+
+SELECT * FROM accounts;
+```
+
+**Expected Output (Connection 1):**
+
+```text
+ id |  name   | balance
+----+---------+---------
+  1 | Jia     |     150
+  2 | Allison |      50
+(2 rows)
+```
+
+Querying Connection 2 at this point still returns \$100 for both Allison and Jia.
+
+#### Merging Changes with COMMIT
+
+To publish uncommitted workspace changes into the shared main data pool, issue `COMMIT`:
+
+```sql
+-- Inside Connection 1:
+COMMIT;
+```
+
+Once committed, the private workspace merges into the main data pool. Re-running `SELECT * FROM accounts;` in Connection 2 (or any other connection) now reflects the finalized transfer:
+
+**Expected Output (All Connections):**
+
+```text
+ id |  name   | balance
+----+---------+---------
+  1 | Jia     |     150
+  2 | Allison |      50
+(2 rows)
+```
+
+---
+
+### Crash Recovery: Automatic Cleanup on Disconnection
+
+A core guarantee of transactional databases is automatic failure recovery when an application server or connection unexpectedly dies mid-operation.
+
+#### Simulating an Application Server Crash in pgAdmin
+
+To verify crash cleanup behavior:
+
+1. Reset both account balances to \$100:
+   ```sql
+   UPDATE accounts
+   SET balance = 100;
+   ```
+2. Open a new transaction and deduct \$50 from Allison:
+
+   ```sql
+   BEGIN;
+
+   UPDATE accounts
+   SET balance = balance - 50
+   WHERE name = 'Allison';
+
+   SELECT * FROM accounts;
+   ```
+
+   At this stage, Allison has \$50 in this connection, but Jia has not yet received the funds.
+
+3. Simulate an unexpected crash by killing the connection:
+   - Navigate to the **Dashboard** tab in pgAdmin.
+   - Locate the active sessions under **Server Activity** (typically named `pgadmin - conn`).
+   - Click the red **Terminate Session** (`X`) icon to immediately kill the connection.
+
+#### Automatic Cleanup Verification
+
+Once the connection is terminated, open a new Query Tool window and inspect the table:
+
+```sql
+SELECT * FROM accounts;
+```
+
+**Expected Output Sample:**
+
+```text
+ id |  name   | balance
+----+---------+---------
+  1 | Jia     |     100
+  2 | Allison |     100
+(2 rows)
+```
+
+**Engineering Takeaway:** PostgreSQL actively monitors client connections. When a connection drops unexpectedly without an explicit `COMMIT`, PostgreSQL immediately purges the isolated workspace. Allison's \$50 was never permanently withdrawn, protecting the system from partial-write corruption.
+
+---
+
+### Error Handling: The Aborted Transaction State
+
+When a query within an active transaction fails due to a syntax error, constraint violation, or non-existent table, PostgreSQL shifts the transaction into an **aborted state**.
+
+#### Encountering an Error Inside a Transaction
+
+Consider opening a transaction and attempting to query a non-existent table:
+
+```sql
+BEGIN;
+
+-- Deliberately query a non-existent relation
+SELECT * FROM non_existent_table;
+```
+
+**Expected Output Sample:**
+
+```text
+ERROR:  relation "non_existent_table" does not exist
+LINE 1: SELECT * FROM non_existent_table;
+                      ^
+```
+
+Once this error occurs, attempting to execute any subsequent query—even a completely valid one—is rejected by PostgreSQL:
+
+```sql
+SELECT * FROM accounts;
+```
+
+**Expected Output Sample:**
+
+```text
+ERROR:  current transaction is aborted, commands ignored until end of transaction block
+```
+
+> [!IMPORTANT]
+> When PostgreSQL encounters an error inside a transaction block, it refuses to execute further commands. This prevents downstream statements from running on top of an already-failed or inconsistent operational state.
+
+#### Resolving the Aborted State with ROLLBACK
+
+To exit the aborted state and restore the connection to normal operation, you must execute `ROLLBACK`:
+
+```sql
+-- Close the aborted transaction and discard changes
+ROLLBACK;
+
+-- Verify normal operation is restored
+SELECT * FROM accounts;
+```
+
+**Expected Output Sample:**
+
+```text
+ROLLBACK
+
+ id |  name   | balance
+----+---------+---------
+  1 | Jia     |     100
+  2 | Allison |     100
+(2 rows)
+```
+
+After issuing `ROLLBACK`, the transaction workspace is cleared, uncommitted modifications are discarded, and the connection is ready to run standard queries again.
+
+---
+
+### Summary Comparison of Transaction Termination Outcomes
+
+The following table summarizes the four paths by which a PostgreSQL transaction concludes:
+
+| Termination Outcome               | Triggering Action / Event                                     | Impact on Data                                                                                             | Connection State Afterward                       |
+| :-------------------------------- | :------------------------------------------------------------ | :--------------------------------------------------------------------------------------------------------- | :----------------------------------------------- |
+| **Commit**                        | Executing `COMMIT;`                                           | Merges workspace modifications into the main data pool; visible to all clients.                            | Idle / Normal (outside transaction block).       |
+| **Manual Rollback**               | Executing `ROLLBACK;`                                         | Discards all workspace modifications; leaves data identical to pre-transaction state.                      | Idle / Normal (outside transaction block).       |
+| **Aborted Transaction Recovery**  | SQL runtime error, followed by manual `ROLLBACK;`             | All statements after the error are rejected; executing `ROLLBACK;` discards changes and resets connection. | Idle / Normal (outside transaction block).       |
+| **Crash / Disconnection Cleanup** | Client process crash, network severance, or terminated socket | PostgreSQL automatically detects client loss, terminates the session, and purges workspace data.           | Session terminated; new connection starts clean. |
+
+---
+
+### Review & Knowledge Check
+
+<details>
+<summary><b>Question 1: What critical problem occurs if a multi-step operation like a bank transfer is executed without a transaction?</b></summary>
+<br>
+<b>Answer:</b> If a crash or error occurs between individual statements (such as after deducting funds from one account but before crediting another), the system is left in a partially updated, inconsistent state where money has vanished without record. Transactions guarantee atomicity—either all steps complete, or none do.
+</details>
+
+<details>
+<summary><b>Question 2: If Connection 1 executes an UPDATE statement inside a transaction without committing, why does Connection 2 still see the original data?</b></summary>
+<br>
+<b>Answer:</b> Modifications made inside an open transaction are confined to that connection's isolated workspace. PostgreSQL prevents other connections from viewing uncommitted changes (providing isolation) until the transaction explicitly executes <code>COMMIT;</code>.
+</details>
+
+<details>
+<summary><b>Question 3: What happens to uncommitted changes if an application server crashes or loses its network connection to PostgreSQL mid-transaction?</b></summary>
+<br>
+<b>Answer:</b> PostgreSQL automatically detects that the client connection has dropped, terminates the associated transaction, and purges the isolated workspace. None of the uncommitted modifications are merged into the main data pool.
+</details>
+
+<details>
+<summary><b>Question 4: What causes the error message "current transaction is aborted, commands ignored until end of transaction block", and how do you recover?</b></summary>
+<br>
+<b>Answer:</b> This occurs when a query inside an active transaction encounters an error (such as referencing an invalid table or violating a constraint). PostgreSQL enters an aborted state to protect against further mutations. You recover by issuing <code>ROLLBACK;</code>, which closes the transaction block and resets the connection for normal queries.
+</details>
