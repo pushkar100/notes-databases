@@ -103,6 +103,7 @@
    * [Database Schema Migrations in Practice](#database-schema-migrations-in-practice)
    * [Schema vs Data Migrations and Having a Plan](#schema-vs-data-migrations-and-having-a-plan)
    * [Full-Stack Database Integration: Architecture, Pooling, and Route Scaffolding](#full-stack-database-integration-architecture-pooling-and-route-scaffolding)
+   * [The Repository Pattern - Data Access Layer](#the-repository-pattern-data-access-layer)
 
 
 <!-- TOC end -->
@@ -9150,4 +9151,583 @@ query(sql, params) {
 <summary><b>Question 5: What problem occurs during test teardown if pool.close() (calling pool.end()) is omitted?</b></summary>
 <br>
 <b>Answer:</b> If <code>pool.end()</code> is not called, the pool keeps its open client TCP sockets alive in the Node.js event loop. Test runners like Jest will detect these dangling open handles and hang indefinitely instead of exiting cleanly after tests complete.
+</details>
+
+
+## The Repository Pattern - Data Access Layer
+
+### Architectural Overview: Why Use the Repository Pattern?
+
+When building a backend web API with Express and PostgreSQL, route handlers frequently need to fetch, insert, update, or delete records from database tables. A naive first approach might be to import the database connection pool directly into every route file and execute raw SQL queries right inside the HTTP request handlers.
+
+While executing queries directly inside route handlers works for tiny scripts, it creates severe architectural problems as an application grows:
+1. **Tight Coupling:** The web layer (HTTP verbs, status codes, query parameters) becomes tangled with the database layer (SQL strings, table schemas, column names).
+2. **Code Duplication:** If multiple endpoints or background jobs need to fetch a user by ID or validate an email, the same SQL statements end up copied across multiple files.
+3. **Difficult Testing and Refactoring:** Changing a database column name or table schema requires hunting down SQL statements scattered across dozens of route files.
+
+To solve this, backend applications use the **Repository Pattern**. A repository is a dedicated JavaScript module that acts as the single, centralized gateway governing all database interactions for a specific database table or resource (such as the `users` table).
+
+```text
++----------------------------------------------------------------------------------------------------+
+|                                    REPOSITORY PATTERN ARCHITECTURE                                 |
++----------------------------------------------------------------------------------------------------+
+|                                                                                                    |
+|   +--------------------------+                                                                     |
+|   |   Incoming HTTP Request  |                                                                     |
+|   |   (e.g., GET /users/1)   |                                                                     |
+|   +------------+-------------+                                                                     |
+|                |                                                                                   |
+|                v                                                                                   |
+|   +--------------------------+                                                                     |
+|   |   Express Route Handler  |  <--- Handles HTTP details (req.params, status codes, JSON responses)|
+|   |   (src/routes/users.js)  |                                                                     |
+|   +------------+-------------+                                                                     |
+|                |                                                                                   |
+|                | Calls high-level method: UserRepo.findById(1)                                     |
+|                v                                                                                   |
+|   +--------------------------+                                                                     |
+|   |      User Repository     |  <--- Centralized access point for the "users" table.               |
+|   |  (src/repos/user-repo.js)|       Encapsulates SQL queries and data normalization.              |
+|   +------------+-------------+                                                                     |
+|                |                                                                                   |
+|                | Issues SQL: SELECT * FROM users WHERE id = 1;                                     |
+|                v                                                                                   |
+|   +--------------------------+                                                                     |
+|   |    Database Pool Wrapper |  <--- Manages PostgreSQL client connections                         |
+|   |       (src/pool.js)      |                                                                     |
+|   +------------+-------------+                                                                     |
+|                |                                                                                   |
+|                v                                                                                   |
+|   +--------------------------+                                                                     |
+|   |   PostgreSQL Database    |  <--- Executes query on "users" table and returns raw rows          |
+|   +--------------------------+                                                                     |
+|                                                                                                    |
++----------------------------------------------------------------------------------------------------+
+```
+
+#### Core Responsibilities of a Repository
+
+In this pattern:
+- The **Route Handler** is only responsible for parsing HTTP request parameters and returning HTTP responses (e.g., sending JSON data with a `200 OK` or sending a `404 Not Found`).
+- The **Repository** is strictly responsible for reaching into the database, executing the required SQL queries, formatting the returned data, and returning clean JavaScript objects or arrays.
+
+Typical methods attached to a `UserRepo` include:
+- `find()`: Retrieves all user records.
+- `findById(id)`: Retrieves a single user matching a specific ID.
+- `insert(userData)`: Creates a new user row.
+- `update(id, userData)`: Modifies an existing user row.
+- `delete(id)`: Removes a user row.
+- Additional domain-specific utility methods can be added as needed, such as `count()`, `findByUsername(username)`, or `validate()`.
+
+### Designing the Repository: Three Implementation Approaches
+
+In JavaScript, there are several ways to structure and export a repository. All three approaches accomplish the same goal; choosing between them comes down to team style and code readability.
+
+#### Option 1: Exporting a Plain Object
+
+Define an object containing functions and export it directly:
+
+```javascript
+// src/repos/user-repo.js (Plain Object Approach)
+const pool = require('../pool');
+
+module.exports = {
+  find() {
+    return pool.query('SELECT * FROM users;');
+  },
+  findById(id) {
+    return pool.query('SELECT * FROM users WHERE id = $1;', [id]);
+  }
+};
+```
+
+#### Option 2: Exporting an Instance of a Class
+
+Define an ES6 class with instance methods and export a newly instantiated object:
+
+```javascript
+// src/repos/user-repo.js (Class Instance Approach)
+const pool = require('../pool');
+
+class UserRepo {
+  find() {
+    return pool.query('SELECT * FROM users;');
+  }
+  findById(id) {
+    return pool.query('SELECT * FROM users WHERE id = $1;', [id]);
+  }
+}
+
+module.exports = new UserRepo();
+```
+
+#### Option 3: Exporting a Class with Static Methods (Recommended)
+
+Define an ES6 class where every method is marked with the `static` keyword, and export the class constructor itself:
+
+```javascript
+// src/repos/user-repo.js (Static Methods Approach)
+const pool = require('../pool');
+
+class UserRepo {
+  static async find() {
+    // Accessible directly as UserRepo.find() without calling 'new'
+  }
+  static async findById(id) {
+    // Accessible directly as UserRepo.findById(id)
+  }
+  static async insert() {}
+  static async update() {}
+  static async delete() {}
+}
+
+module.exports = UserRepo;
+```
+
+#### Architectural Comparison of Repository Patterns
+
+| Approach | Consumer Syntax | Instantiation Overhead | Best Used For |
+| :--- | :--- | :--- | :--- |
+| **Plain Object** | `UserRepo.find()` | Zero overhead; single object in memory | Simple repositories without state or inheritance |
+| **Class Instance** | `UserRepo.find()` | Requires instantiating `new UserRepo()` once at export | When subclasses need to share common base repo logic |
+| **Static Class Methods** | `UserRepo.find()` | Zero instantiation; clean, explicit class syntax | Production backend APIs seeking clean, readable structure |
+
+> [!TIP]
+> Static class methods provide a clean, self-documenting syntax. Other files can import `UserRepo` and immediately call `UserRepo.find()` or `UserRepo.findById(id)` without worrying about managing class instances.
+
+### Implementing the First Repository Method: Fetching All Users
+
+To build our data access layer, we create a dedicated `repos` directory under `src/`, containing `user-repo.js`.
+
+#### Understanding the `pool.query()` Return Value
+
+When `pool.query()` executes, PostgreSQL returns an extensive result object containing execution metadata, column definitions, command tags, and query statistics. For standard data retrieval, the application only needs the actual records, which are stored inside the `rows` array property on that result object.
+
+Instead of keeping the entire result object, we destructure `{ rows }` directly from the awaited query response.
+
+#### Implementation: `src/repos/user-repo.js`
+
+```javascript
+// src/repos/user-repo.js
+const pool = require('../pool');
+
+class UserRepo {
+  // Static async method to fetch all users from the database
+  static async find() {
+    // Execute the SQL query and destructure 'rows' from the result object
+    const { rows } = await pool.query('SELECT * FROM users;');
+
+    // Return the array of user row objects
+    return rows;
+  }
+
+  static async findById(id) {}
+  static async insert() {}
+  static async update() {}
+  static async delete() {}
+}
+
+module.exports = UserRepo;
+```
+
+#### Connecting `UserRepo` to the Route Handler: `src/routes/users.js`
+
+Now we hook the repository method into the Express router. The route handler awaits `UserRepo.find()` and sends the resulting array back to the client:
+
+```javascript
+// src/routes/users.js
+const express = require('express');
+const UserRepo = require('../repos/user-repo');
+
+const router = express.Router();
+
+// GET /users - Retrieve a list of all users
+router.get('/users', async (req, res) => {
+  const users = await UserRepo.find();
+  res.send(users);
+});
+
+module.exports = router;
+```
+
+### API Testing Workflows: Postman vs. VS Code REST Client
+
+To verify our newly created endpoint, we first start the development server from the terminal:
+
+```bash
+# Start the Express API server (listening on port 3005)
+npm run start
+```
+
+```text
+> my-app@1.0.0 start
+> node index.js
+
+Listening on port 3005
+Connected to PostgreSQL database
+```
+
+To send test HTTP requests, developers typically choose between two tools:
+1. **Postman:** A standalone GUI application for sending requests, inspecting headers, and organizing collections.
+2. **VS Code REST Client:** A lightweight editor extension (by Huachao Mao) that executes HTTP requests directly from plain-text `.http` files inside the workspace.
+
+```text
++----------------------------------------------------------------------------------------------------+
+|                                    API TESTING TOOL COMPARISON                                     |
++----------------------------------------------------------------------------------------------------+
+|                                                                                                    |
+|   POSTMAN (Standalone Desktop App)             REST CLIENT (VS Code Extension)                     |
+|   +------------------------------------+       +------------------------------------+              |
+|   | [GET] http://localhost:3005/users  |       | File: request.http                 |              |
+|   | [ Send ]                           |       |                                    |              |
+|   +------------------------------------+       | http://localhost:3005/users        |              |
+|   | Response:                          |       | ###                                |              |
+|   | []                                 |       | http://localhost:3005/users/1      |              |
+|   +------------------------------------+       +------------------------------------+              |
+|   Requires account, GUI switching              Checked into Git, runs in editor                    |
+|                                                                                                    |
++----------------------------------------------------------------------------------------------------+
+```
+
+#### Setting Up `request.http`
+
+Create a file named `request.http` in the root of the project. Individual requests are separated using a triple-hash delimiter (`###`):
+
+```http
+### Request 1: Fetch all users
+http://localhost:3005/users
+
+### Request 2: Fetch a specific user by ID
+http://localhost:3005/users/1
+```
+
+Clicking **"Send Request"** in VS Code runs the request and displays the response in an adjacent editor tab. Because our database table has no records yet, the endpoint returns an empty array:
+
+```text
+HTTP/1.1 200 OK
+Content-Type: application/json; charset=utf-8
+Content-Length: 2
+
+[]
+```
+
+### Database Seeding and Casing Discrepancies
+
+To verify data retrieval with actual rows, we manually insert two sample records into the `users` table using pgAdmin's Query Tool:
+
+```sql
+-- Insert two sample users into the social-network database
+INSERT INTO users (bio, username)
+VALUES
+  ('This is my bio', 'Alison14'),
+  ('This is about me', '67');
+
+-- Verify rows in pgAdmin
+SELECT * FROM users;
+```
+
+When we re-run `GET http://localhost:3005/users`, the API returns our two users:
+
+```json
+[
+  {
+    "id": 1,
+    "created_at": "2026-11-21T10:00:00.000Z",
+    "updated_at": "2026-11-21T10:00:00.000Z",
+    "bio": "This is my bio",
+    "username": "Alison14"
+  },
+  {
+    "id": 2,
+    "created_at": "2026-11-21T10:00:00.000Z",
+    "updated_at": "2026-11-21T10:00:00.000Z",
+    "bio": "This is about me",
+    "username": "67"
+  }
+]
+```
+
+#### The Casing Mismatch Problem: `snake_case` vs. `camelCase`
+
+Notice the column names returned: `created_at` and `updated_at`.
+- **SQL Convention:** Relational databases overwhelmingly use `snake_case` (words separated by underscores: `created_at`, `updated_at`).
+- **JavaScript Convention:** JavaScript idiomatic style strictly uses `camelCase` (capitalizing subsequent words without underscores: `createdAt`, `updatedAt`).
+
+If we leave these properties as `snake_case`, any JavaScript code working with these objects must do:
+
+```javascript
+// Inconsistent JavaScript style:
+const userCreationDate = user.created_at;
+```
+
+This violates JavaScript conventions and causes inconsistent naming across the codebase, where frontend components, business logic, and API payloads mix `camelCase` and `snake_case`.
+
+#### Evaluating Solutions to the Casing Issue
+
+| Approach | Mechanics | Trade-offs | Recommendation |
+| :--- | :--- | :--- | :--- |
+| **1. Accept `snake_case` Everywhere** | Leave keys as returned by Postgres. | Creates mixed casing styles in JavaScript code. | Not recommended; leads to sloppy codebase hygiene. |
+| **2. Rename Database Columns** | Name SQL columns with camelCase (e.g., `"createdAt"`). | Requires wrapping column names in double quotes in every SQL statement; violates SQL standards. | Not recommended; causes friction with database tooling. |
+| **3. Normalization Transformation Layer** | Automatically intercept database rows and convert keys from `snake_case` to `camelCase` before returning to JavaScript code. | Clean separation: SQL remains standard `snake_case`, JavaScript remains standard `camelCase`. | **Recommended Pattern**; standard industry practice. |
+
+### Normalizing Database Keys: Building the `toCamelCase` Utility
+
+Rather than manually renaming keys in every repository query, we build a reusable utility function that takes an array of database row objects and automatically converts all `snake_case` (or `kebab-case`) property names to `camelCase`.
+
+#### The Key Replacement Algorithm
+
+To transform any key, we use a regular expression: `/([-_][a-z])/gi`
+- `[-_]`: Matches an underscore `_` or hyphen `-`.
+- `[a-z]`: Matches the following lowercase letter.
+- `g`: Global flag (find all matches in the string).
+- `i`: Case-insensitive flag.
+
+For every match (captured as `$1`, e.g., `_a`), the replacement callback converts `$1` to uppercase (`_A`) and removes the underscore, yielding `A`.
+
+```text
+Input Key:      "created_at"
+Regex Match:            --
+Match ($1):             "_a"
+Uppercase:              "_A"
+Replace "_" with "":    "A"
+Output Key:     "createdAt"
+```
+
+#### Creating `src/repos/utils/to-camel-case.js`
+
+We extract this logic into a dedicated helper module:
+
+```javascript
+// src/repos/utils/to-camel-case.js
+
+/**
+ * Transforms an array of database row objects by converting all
+ * snake_case property keys into idiomatic camelCase property keys.
+ * 
+ * @param {Array<Object>} rows - Array of raw rows from PostgreSQL.
+ * @returns {Array<Object>} Array of rows with camelCased keys.
+ */
+module.exports = (rows) => {
+  return rows.map((row) => {
+    const replaced = {};
+
+    for (let key in row) {
+      // Find underscores or dashes followed by a character and convert to uppercase
+      const camelCase = key.replace(/([-_][a-z])/gi, ($1) =>
+        $1.toUpperCase().replace('_', '')
+      );
+      replaced[camelCase] = row[key];
+    }
+
+    return replaced;
+  });
+};
+```
+
+#### Updating `UserRepo.find()` with Casing Normalization
+
+We import `toCamelCase` into `src/repos/user-repo.js` and wrap the query rows before returning them:
+
+```javascript
+// src/repos/user-repo.js
+const pool = require('../pool');
+const toCamelCase = require('./utils/to-camel-case');
+
+class UserRepo {
+  static async find() {
+    const { rows } = await pool.query('SELECT * FROM users;');
+    // Normalize keys to camelCase before returning to the route handler
+    return toCamelCase(rows);
+  }
+}
+
+module.exports = UserRepo;
+```
+
+#### Expected Output After Normalization
+
+Sending `GET http://localhost:3005/users` now returns clean, idiomatic JavaScript objects:
+
+```json
+[
+  {
+    "id": 1,
+    "createdAt": "2026-11-21T10:00:00.000Z",
+    "updatedAt": "2026-11-21T10:00:00.000Z",
+    "bio": "This is my bio",
+    "username": "Alison14"
+  },
+  {
+    "id": 2,
+    "createdAt": "2026-11-21T10:00:00.000Z",
+    "updatedAt": "2026-11-21T10:00:00.000Z",
+    "bio": "This is about me",
+    "username": "67"
+  }
+]
+```
+
+### Fetching Individual Records: Implementing `findById` and 404 Handling
+
+With `find()` complete, we implement `findById(id)` to retrieve a single user record by their primary key.
+
+#### Route Handler Implementation: `src/routes/users.js`
+
+In RESTful APIs, requesting a resource that does not exist should return an HTTP `404 Not Found` status. If the user exists, we return the user object with `200 OK`:
+
+```javascript
+// src/routes/users.js
+
+// GET /users/:id - Retrieve a single user by primary key ID
+router.get('/users/:id', async (req, res) => {
+  const { id } = req.params;
+
+  // Query the repository for the user
+  const user = await UserRepo.findById(id);
+
+  // Return user if found, otherwise send 404 Not Found
+  if (user) {
+    res.send(user);
+  } else {
+    res.sendStatus(404);
+  }
+});
+```
+
+#### Repository Method Implementation: `src/repos/user-repo.js`
+
+Inside `UserRepo`, `findById` queries for rows matching the specified ID, runs the results through `toCamelCase`, and returns the first element (`rows[0]`):
+
+```javascript
+// src/repos/user-repo.js
+const pool = require('../pool');
+const toCamelCase = require('./utils/to-camel-case');
+
+class UserRepo {
+  static async find() {
+    const { rows } = await pool.query('SELECT * FROM users;');
+    return toCamelCase(rows);
+  }
+
+  static async findById(id) {
+    // Execute query to find user with the matching ID
+    const { rows } = await pool.query(`
+      SELECT * FROM users WHERE id = ${id};
+    `);
+
+    // toCamelCase returns an array. Taking index [0] returns either
+    // the single user object, or undefined if the array is empty.
+    return toCamelCase(rows)[0];
+  }
+}
+
+module.exports = UserRepo;
+```
+
+#### Request & Response Sequence Flow
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor Client as HTTP Client (REST Client)
+    participant Router as Users Router (routes/users.js)
+    participant Repo as UserRepo (repos/user-repo.js)
+    participant Utils as toCamelCase Utility (utils/to-camel-case.js)
+    participant DB as PostgreSQL Database
+
+    Client->>Router: GET /users/1
+    Router->>Repo: findById(1)
+    Repo->>DB: SELECT * FROM users WHERE id = 1;
+    DB-->>Repo: Raw database rows (snake_case)
+    Repo->>Utils: toCamelCase(rows)
+    Utils-->>Repo: Normalized rows (camelCase)
+    Repo-->>Router: Single user object or undefined (rows[0])
+    alt User exists in database
+        Router-->>Client: 200 OK (User JSON payload)
+    else User does not exist (undefined)
+        Router-->>Client: 404 Not Found
+    end
+```
+
+#### Testing the Endpoint in `request.http`
+
+Add test requests for both existing and non-existent user IDs:
+
+```http
+### Test 1: Fetch existing user (ID 1)
+http://localhost:3005/users/1
+
+### Test 2: Fetch existing user (ID 2)
+http://localhost:3005/users/2
+
+### Test 3: Fetch non-existent user (ID 3)
+http://localhost:3005/users/3
+```
+
+**Expected Output for Existing User (ID 1):**
+```text
+HTTP/1.1 200 OK
+Content-Type: application/json; charset=utf-8
+
+{
+  "id": 1,
+  "createdAt": "2026-11-21T10:00:00.000Z",
+  "updatedAt": "2026-11-21T10:00:00.000Z",
+  "bio": "This is my bio",
+  "username": "Alison14"
+}
+```
+
+**Expected Output for Non-Existent User (ID 3):**
+```text
+HTTP/1.1 404 Not Found
+Content-Type: text/plain; charset=utf-8
+
+Not Found
+```
+
+### Security Alert: SQL Injection in Unparameterized Queries
+
+> [!CAUTION]
+> **Severe Vulnerability: Direct String Interpolation in SQL Queries**
+> 
+> In the `findById` implementation above, the SQL query was constructed using template string interpolation:
+> ```javascript
+> // NEVER USE IN PRODUCTION CODE:
+> pool.query(`SELECT * FROM users WHERE id = ${id};`);
+> ```
+> This creates a critical **SQL Injection (SQLi)** vulnerability. Because `id` is directly embedded into the raw SQL string without sanitization or parameter binding, an attacker can supply malicious input in the URL parameter (e.g., `1; DROP TABLE users;` or `1 OR 1=1`) to alter the query logic, leak sensitive database records, or drop entire database tables.
+> 
+> Production code must always use **parameterized queries** (e.g., `pool.query('SELECT * FROM users WHERE id = $1;', [id])`) where user inputs are transmitted separately from the SQL statement as bound data arguments.
+
+### Interactive Knowledge Check Quiz
+
+<details>
+<summary><b>Question 1: What core problem does the Repository Pattern solve in a Node.js backend application?</b></summary>
+<br>
+<b>Answer:</b> The Repository Pattern decouples the web routing layer from direct database access. Instead of scattering raw SQL queries across multiple Express route handlers, the repository centralizes all database interactions for a resource into a single module, improving maintainability, code reuse, and testability.
+</details>
+
+<details>
+<summary><b>Question 2: Why do we destructure <code>{ rows }</code> when handling the return value of <code>pool.query()</code>?</b></summary>
+<br>
+<b>Answer:</b> <code>pool.query()</code> returns a large result object containing query metadata, column types, command status tags, and row counts. The actual database records returned by the query are stored specifically in the <code>rows</code> array property on that object.
+</details>
+
+<details>
+<summary><b>Question 3: Why should a backend application normalize database column names to camelCase?</b></summary>
+<br>
+<b>Answer:</b> PostgreSQL standard conventions use <code>snake_case</code> (e.g., <code>created_at</code>), whereas JavaScript idiomatically uses <code>camelCase</code> (e.g., <code>createdAt</code>). Normalizing row keys ensures consistent naming across JavaScript business logic, frontend components, and API responses without violating SQL database naming standards.
+</details>
+
+<details>
+<summary><b>Question 4: In <code>UserRepo.findById(id)</code>, how does <code>toCamelCase(rows)[0]</code> safely handle a query for an ID that does not exist?</b></summary>
+<br>
+<b>Answer:</b> When a query matches no records, PostgreSQL returns an empty array: <code>rows = []</code>. Passing <code>[]</code> into <code>toCamelCase()</code> returns an empty array <code>[]</code>. Accessing index <code>[0]</code> of an empty array evaluates to <code>undefined</code>. The route handler can then test <code>if (user)</code> and cleanly send an HTTP 404 status.
+</details>
+
+<details>
+<summary><b>Question 5: Why is constructing SQL queries with template string interpolation (e.g., <code>`... WHERE id = ${id}`</code>) dangerous?</b></summary>
+<br>
+<b>Answer:</b> Direct string interpolation concatenates untrusted user input directly into the executable SQL command. This enables SQL Injection attacks, allowing malicious users to execute arbitrary SQL commands against the database. SQL queries should always use parameterized inputs (e.g., <code>$1</code>).
 </details>
