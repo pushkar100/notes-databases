@@ -1,4 +1,4 @@
-# PostgreSQL JSON
+# PostgreSQL JSON and JSONB
 
 [Neon PostgreSQL Tutorial](https://neon.com/postgresql/tutorial/json)
 
