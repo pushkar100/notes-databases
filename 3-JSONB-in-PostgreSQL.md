@@ -616,7 +616,7 @@ Output:
 ```text
  is_contained
 --------------
- t
+ true
 (1 row)
 ```
 
