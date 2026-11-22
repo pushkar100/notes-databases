@@ -34,6 +34,7 @@
       + [The Evolution: UUID v4 vs. UUID v7](#the-evolution-uuid-v4-vs-uuid-v7)
          - [Why UUID v4 Hurts Database Performance](#why-uuid-v4-hurts-database-performance)
          - [Why UUID v7 is the Modern Standard (RFC 9562)](#why-uuid-v7-is-the-modern-standard-rfc-9562)
+         - [Implementing UUID v7 in PostgreSQL (Extension & Inserts)](#implementing-uuid-v7-in-postgresql-extension-inserts)
       + [Choosing the Right Key Strategy](#choosing-the-right-key-strategy)
          - [The Core Mental Framework: 4 Strategic Questions](#the-core-mental-framework-4-strategic-questions)
          - [Strategy 1: Non-UUID Keys in Microservices (Database-per-Service)](#strategy-1-non-uuid-keys-in-microservices-database-per-service)
@@ -646,6 +647,74 @@ CREATE TABLE distributed_events (
     recorded_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
 );
 ```
+
+#### Implementing UUID v7 in PostgreSQL (Extension & Inserts)
+
+To generate UUID v7 directly inside PostgreSQL, you can enable the `pg_uuidv7` extension (the official community extension standardizing RFC 9562):
+
+##### Installing the Extension
+
+```sql
+-- Enable the UUID v7 extension:
+CREATE EXTENSION IF NOT EXISTS "pg_uuidv7";
+
+-- Test generating a single UUID v7:
+SELECT uuid_generate_v7();
+```
+
+**Output:**
+
+```text
+           uuid_generate_v7
+--------------------------------------
+ 01934c21-95c0-7b22-8df1-e7a930b809a1
+(1 row)
+```
+
+##### Creating a Table with a UUID v7 Primary Key
+
+Use `DEFAULT uuid_generate_v7()` so the database automatically assigns a time-ordered UUID whenever a new row is created:
+
+```sql
+CREATE TABLE app_events (
+    event_id UUID DEFAULT uuid_generate_v7() PRIMARY KEY,
+    event_type TEXT NOT NULL,
+    user_id BIGINT NOT NULL,
+    metadata JSONB DEFAULT '{}'::jsonb
+);
+```
+
+##### Running Inserts and Inspecting Sequential Output
+
+```sql
+INSERT INTO app_events (event_type, user_id, metadata)
+VALUES
+    ('user_signed_up', 101, '{"source": "google_oauth"}'::jsonb),
+    ('order_placed',   101, '{"order_id": 5001, "total": 129.50}'::jsonb),
+    ('payment_cleared', 101, '{"provider": "stripe", "status": "succeeded"}'::jsonb)
+RETURNING event_id, event_type, user_id;
+```
+
+**Output:**
+
+```text
+               event_id               |   event_type    | user_id
+--------------------------------------+-----------------+---------
+ 01934c21-95c0-7b22-8df1-e7a930b809a1 | user_signed_up  |     101
+ 01934c21-95c1-7994-bf99-8cf4b16260e3 | order_placed    |     101
+ 01934c21-95c2-7471-a481-807c4bc47a32 | payment_cleared |     101
+(3 rows)
+```
+
+> [!TIP]
+> **Notice the Leading Digits:** Look at the first 3 segments of `event_id`:
+>
+> - `01934c21-95c0...` (1st insert)
+> - `01934c21-95c1...` (2nd insert)
+> - `01934c21-95c2...` (3rd insert)
+>
+> Because the millisecond timestamp sits in the most significant bits, the values **monotonically increase over time**. An `ORDER BY event_id ASC` query sorts chronologically without needing a separate `created_at` index, and PostgreSQL appends new rows directly to the rightmost leaf of the B-Tree index with zero random page fragmentation.
+
 
 ### Choosing the Right Key Strategy
 
