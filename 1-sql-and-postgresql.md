@@ -104,6 +104,7 @@
    * [Schema vs Data Migrations and Having a Plan](#schema-vs-data-migrations-and-having-a-plan)
    * [Full-Stack Database Integration: Architecture, Pooling, and Route Scaffolding](#full-stack-database-integration-architecture-pooling-and-route-scaffolding)
    * [The Repository Pattern - Data Access Layer](#the-repository-pattern---data-access-layer)
+   * [Prepared Statements for SQL Injection Prevention and CRUD Operations](#prepared-statements-for-sql-injection-prevention-and-crud-operations)
 
 
 <!-- TOC end -->
@@ -9730,4 +9731,667 @@ Not Found
 <summary><b>Question 5: Why is constructing SQL queries with template string interpolation (e.g., <code>`... WHERE id = ${id}`</code>) dangerous?</b></summary>
 <br>
 <b>Answer:</b> Direct string interpolation concatenates untrusted user input directly into the executable SQL command. This enables SQL Injection attacks, allowing malicious users to execute arbitrary SQL commands against the database. SQL queries should always use parameterized inputs (e.g., <code>$1</code>).
+</details>
+
+## Prepared Statements for SQL Injection Prevention and CRUD Operations
+
+### Understanding the SQL Injection Vulnerability
+
+When building backend web APIs that interact with databases, one of the most critical security responsibilities is ensuring that user-supplied input cannot alter the intended logic of SQL commands.
+
+In early application prototypes, developers often use direct string interpolation (template strings) to insert variables straight into SQL queries:
+
+```javascript
+// DANGEROUS PATTERN: Never use in production code
+pool.query(`SELECT * FROM users WHERE id = ${id};`);
+```
+
+While this works as expected when a user passes a standard ID like `1` or `2`, it opens a catastrophic security flaw known as a **SQL Injection (SQLi) exploit**.
+
+#### Demonstrating the Exploit: The Dropped Table Incident
+
+Consider what happens when a client sends an HTTP GET request to fetch a user:
+
+```http
+GET http://localhost:3005/users/1; DROP TABLE users;
+```
+
+In Express, route parameters defined like `/users/:id` are extracted as plain JavaScript strings:
+- The parameter `req.params.id` receives the string value `"1; DROP TABLE users;"`.
+- If the application interpolates this string directly into the SQL statement, the query string sent to PostgreSQL becomes:
+
+```sql
+SELECT * FROM users WHERE id = 1; DROP TABLE users;
+```
+
+PostgreSQL interprets the semicolon (`;`) as a query delimiter separating two distinct SQL commands:
+1. `SELECT * FROM users WHERE id = 1;` (Fetch user record 1)
+2. `DROP TABLE users;` (Permanently delete the entire `users` table and all records)
+
+When this request executes:
+- The `users` table is completely deleted from the database.
+- Any subsequent request to `/users/1` fails with a database error:
+
+```text
+error: relation "users" does not exist
+```
+
+Inspecting the database in pgAdmin confirms the disaster: running `SELECT * FROM users;` returns the same error, and refreshing the tables list reveals that the table has vanished.
+
+```text
++----------------------------------------------------------------------------------------------------+
+|                                HOW STRING CONCATENATION CAUSES SQL INJECTION                       |
++----------------------------------------------------------------------------------------------------+
+|                                                                                                    |
+|  1. Incoming Malicious URL:                                                                        |
+|     GET /users/1; DROP TABLE users;                                                                |
+|                                                                                                    |
+|  2. Express Route Handler:                                                                         |
+|     Extracts req.params.id as a raw string:                                                        |
+|     id = "1; DROP TABLE users;"                                                                    |
+|                                                                                                    |
+|  3. String Interpolation in Repository:                                                             |
+|     `SELECT * FROM users WHERE id = ${id};`                                                        |
+|                                                                                                    |
+|  4. Executable SQL Sent to Database:                                                               |
+|     +-----------------------------------+-----------------------------+                            |
+|     | Statement 1                       | Statement 2 (INJECTED)      |                            |
+|     | SELECT * FROM users WHERE id = 1; | DROP TABLE users;           |                            |
+|     +-----------------------------------+-----------------------------+                            |
+|                                                                                                    |
+|  5. Result in PostgreSQL:                                                                          |
+|     [X] First statement runs.                                                                      |
+|     [!] Second statement drops the "users" table permanently!                                      |
+|                                                                                                    |
++----------------------------------------------------------------------------------------------------+
+```
+
+#### Why SQL Injection is the Worst-Case Vulnerability
+
+SQL injection allows an arbitrary external user to execute arbitrary commands inside your database simply by modifying an HTTP URL or form field. An attacker can:
+- **Read unauthorized data:** Bypass authentication, steal passwords, or dump customer records.
+- **Modify data:** Change account balances, grant admin permissions, or alter audit logs.
+- **Destroy data:** Drop tables, purge data partitions, or corrupt database schemas.
+
+> [!CAUTION]
+> Never, under any circumstances, use JavaScript template strings (`${...}`) or string concatenation (`+`) to join user-provided values into a SQL statement. Introducing a SQL injection vulnerability into a production system is one of the most severe engineering mistakes possible.
+
+### Recovering and Resetting the Database Environment
+
+Before fixing the code, the database environment must be restored to a clean state with the `users` table recreated and populated.
+
+#### Step 1: Drop and Recreate the Database in pgAdmin
+1. Open pgAdmin.
+2. Right-click the `social-network` database and select **Delete/Drop**.
+3. Right-click **Databases**, select **Create** -> **Database**, and name it `social-network`.
+
+#### Step 2: Rerun Migrations
+In your terminal, run the database migration command to recreate all schema tables:
+
+```bash
+npm run migrate up
+```
+
+**Expected Output:**
+```text
+> social-network@1.0.0 migrate
+> node-pg-migrate up
+
+> Migrations complete!
+```
+
+#### Step 3: Seed Sample Users
+In pgAdmin's Query Tool for `social-network`, insert initial test users:
+
+```sql
+INSERT INTO users (username, bio)
+VALUES
+  ('Alison14', 'This is my bio.'),
+  ('Gia67', 'A little bit about me.');
+
+-- Verify the seed records
+SELECT * FROM users;
+```
+
+**Expected Output in pgAdmin:**
+```text
+id | username | bio                    | created_at             | updated_at
+---+----------+------------------------+------------------------+------------------------
+ 1 | Alison14 | This is my bio.        | 2026-11-22 10:00:00+00 | 2026-11-22 10:00:00+00
+ 2 | Gia67    | A little bit about me. | 2026-11-22 10:00:00+00 | 2026-11-22 10:00:00+00
+```
+
+### Defending Against SQL Injection: Prepared Statements
+
+To safely use user-supplied values in SQL queries, backend engineers choose between two primary strategies:
+
+1. **Application-Level Sanitization (Not Recommended):** Writing custom validation logic or regular expressions in JavaScript to detect and strip out dangerous SQL characters. This approach is error-prone, fragile, and easy to bypass.
+2. **Database-Level Parameterization via Prepared Statements (Recommended):** Delegating input sanitization and binding directly to PostgreSQL. This is the industry-standard defense against SQL injection.
+
+#### How Prepared Statements Work Behind the Scenes
+
+Instead of passing one combined SQL string to the database driver, the query is separated into two independent parts:
+1. **A SQL Template with Placeholders:** Uses `$1`, `$2`, `$3` markers to denote where values will be inserted.
+2. **A Parameters Array:** An ordered list of JavaScript values corresponding to each placeholder index.
+
+```javascript
+pool.query('SELECT * FROM users WHERE id = $1;', [id]);
+```
+
+Under the hood, the `pg` (node-postgres) driver and PostgreSQL execute this in two distinct phases:
+
+```text
++----------------------------------------------------------------------------------------------------+
+|                                PREPARED STATEMENT TWO-STEP EXECUTION                               |
++----------------------------------------------------------------------------------------------------+
+|                                                                                                    |
+|  Phase 1: Query Compilation (Structure Only)                                                      |
+|  Node (pg)  --->  PREPARE stmt_abc AS SELECT * FROM users WHERE id = $1;  --->  PostgreSQL Engine   |
+|                   - Postgres parses the SQL structure and builds an execution plan.                |
+|                   - Identifies that $1 must be treated strictly as a data value.                   |
+|                                                                                                    |
+|  Phase 2: Execution (Data Binding)                                                                 |
+|  Node (pg)  --->  EXECUTE stmt_abc('1; DROP TABLE users;');              --->  PostgreSQL Engine   |
+|                   - Postgres binds the raw input directly to the $1 slot.                          |
+|                   - The input is NEVER parsed or compiled as SQL code.                             |
+|                                                                                                    |
++----------------------------------------------------------------------------------------------------+
+```
+
+#### Why Prepared Statements Guarantee Security
+
+When a prepared statement is compiled, the database fixes the query structure. When the values are supplied during execution, PostgreSQL treats the entire parameter as a **literal data value**—never as executable SQL instructions.
+
+If an attacker passes `"1; DROP TABLE users;"`:
+- PostgreSQL does **not** see two SQL commands separated by a semicolon.
+- PostgreSQL sees a single search command where the column `id` is compared against the literal string `'1; DROP TABLE users;'`.
+- Because `id` is an integer column, PostgreSQL cleanly rejects the operation with a type syntax error, leaving the database completely unharmed.
+
+#### Limitations of Prepared Statements: Values vs. Identifiers
+
+Prepared statements only support binding **literal data values** (strings, numbers, booleans, dates). They **cannot** be used to dynamically substitute SQL **identifiers**, such as:
+- Table names (e.g., `SELECT * FROM $1;` is invalid)
+- Column names (e.g., `SELECT $1 FROM users;` is invalid)
+
+If an application needs dynamic table or column selection, identifiers must be safely whitelisted or validated at the application level.
+
+#### Engineering Comparison: Query Construction Strategies
+
+| Strategy | Security Level | Developer Effort | Performance | Recommendation |
+| :--- | :--- | :--- | :--- | :--- |
+| **String Concatenation** | Zero (Critical SQLi risk) | Low (naive string templates) | Poor (re-parsed every query) | **Never use** |
+| **Custom Sanitization** | Low to Moderate (fragile) | High (complex regex & escaping) | Moderate | **Avoid** |
+| **Prepared Statements (`$1`)** | Maximum (engine-level isolation) | Low (pass query + params array) | High (plans can be cached) | **Industry Standard** |
+
+### Updating the Database Pool Wrapper for Parameters
+
+To support parameterized queries throughout the application, the custom pool wrapper in `src/pool.js` must forward both the SQL query string and the parameters array to node-postgres.
+
+Open `src/pool.js` and update the `query` method:
+
+```javascript
+// src/pool.js
+const pg = require('pg');
+
+class Pool {
+  _pool = null;
+
+  connect(options) {
+    this._pool = new pg.Pool(options);
+    return this._pool.query('SELECT 1 + 1;');
+  }
+
+  close() {
+    return this._pool.end();
+  }
+
+  // Accept a second argument: params (array of values to substitute for $1, $2, etc.)
+  query(sql, params) {
+    return this._pool.query(sql, params);
+  }
+}
+
+module.exports = new Pool();
+```
+
+### Securing `findById` with Parameterized Queries
+
+With the pool updated, refactor the `findById` method inside `src/repos/user-repo.js` to replace the template string with a parameterized query:
+
+```javascript
+// src/repos/user-repo.js
+const pool = require('../pool');
+const toCamelCase = require('./utils/to-camel-case');
+
+class UserRepo {
+  static async find() {
+    const { rows } = await pool.query('SELECT * FROM users;');
+    return toCamelCase(rows);
+  }
+
+  // Secure implementation using $1 placeholder and parameter array
+  static async findById(id) {
+    const { rows } = await pool.query(
+      'SELECT * FROM users WHERE id = $1;',
+      [id]
+    );
+
+    return toCamelCase(rows)[0];
+  }
+}
+
+module.exports = UserRepo;
+```
+
+#### Verifying the Fix Against the SQL Injection Payload
+
+Start the Express development server:
+
+```bash
+npm start
+```
+
+1. **Normal Request (ID 1):**
+   - URL: `GET http://localhost:3005/users/1`
+   - Response: `200 OK` with user data.
+2. **Normal Request (ID 2):**
+   - URL: `GET http://localhost:3005/users/2`
+   - Response: `200 OK` with user data.
+3. **Non-Existent Request (ID 3):**
+   - URL: `GET http://localhost:3005/users/3`
+   - Response: `404 Not Found`.
+4. **Malicious SQL Injection Request:**
+   - URL: `GET http://localhost:3005/users/1; DROP TABLE users;`
+
+**Observed Server Output in Terminal:**
+```text
+error: invalid input syntax for type integer: "1; DROP TABLE users;"
+```
+
+PostgreSQL treated the entire string `"1; DROP TABLE users;"` as the value for `id`. Because the column is an integer, PostgreSQL threw a type error. Re-querying `SELECT * FROM users;` in pgAdmin confirms the `users` table remains completely intact.
+
+### Implementing User Creation (`POST /users`)
+
+Creating a new user requires receiving JSON data in an HTTP POST request, inserting the record into PostgreSQL, and returning the newly created row.
+
+#### Accessing the Request Body in Express
+
+Express parses incoming JSON payloads via the `express.json()` middleware and exposes the parsed data on `req.body`:
+
+```javascript
+router.post('/users', async (req, res) => {
+  const { username, bio } = req.body;
+  // req.body contains { username: 'cookie123', bio: 'I am a cookie' }
+});
+```
+
+#### Testing POST Requests
+
+Requests can be issued using Postman (Method: `POST`, Body: `raw` -> `JSON`) or a VS Code REST Client (`request.http`) file:
+
+```http
+### Create a new user
+POST http://localhost:3005/users HTTP/1.1
+Content-Type: application/json
+
+{
+  "username": "cookie123",
+  "bio": "I am a cookie"
+}
+```
+
+#### The Critical `RETURNING *` Clause in PostgreSQL
+
+By default, an SQL `INSERT` statement does not return the newly inserted row; it only returns a command status tag (e.g., `INSERT 0 1`).
+
+To send the newly created user object back to the client—including its auto-generated `id`, `created_at`, and `updated_at` timestamps—append `RETURNING *` to the query:
+
+```sql
+INSERT INTO users (username, bio) VALUES ($1, $2) RETURNING *;
+```
+
+#### Code Implementation
+
+**Route Handler (`src/routes/users.js`):**
+```javascript
+router.post('/users', async (req, res) => {
+  const { username, bio } = req.body;
+  const user = await UserRepo.insert(username, bio);
+  res.send(user);
+});
+```
+
+**Repository Method (`src/repos/user-repo.js`):**
+```javascript
+static async insert(username, bio) {
+  const { rows } = await pool.query(
+    'INSERT INTO users (username, bio) VALUES ($1, $2) RETURNING *;',
+    [username, bio]
+  );
+
+  return toCamelCase(rows)[0];
+}
+```
+
+**Expected API Response Sample:**
+```text
+HTTP/1.1 200 OK
+Content-Type: application/json; charset=utf-8
+
+{
+  "id": 3,
+  "createdAt": "2026-11-22T10:05:00.000Z",
+  "updatedAt": "2026-11-22T10:05:00.000Z",
+  "bio": "I am a cookie",
+  "username": "cookie123"
+}
+```
+
+### Implementing User Updates (`PUT /users/:id`)
+
+Updating a user record combines data from two separate sources:
+1. **Target User ID:** Provided in the URL parameter (`req.params.id`).
+2. **Updated Data:** Provided in the JSON request body (`req.body`).
+
+#### Parameter Placeholders Alignment
+
+In an `UPDATE` query with multiple placeholders, the order of parameters in the values array must strictly match the numbered placeholders:
+
+```sql
+UPDATE users SET username = $1, bio = $2 WHERE id = $3 RETURNING *;
+```
+- `$1` -> `username` (Array index 0)
+- `$2` -> `bio` (Array index 1)
+- `$3` -> `id` (Array index 2)
+
+#### Handling Non-Existent Records with HTTP 404
+
+If a client attempts to update a user ID that does not exist in the database:
+- The `UPDATE` query affects zero rows (`rows = []`).
+- `toCamelCase(rows)[0]` evaluates to `undefined`.
+- The route handler inspects the returned value and responds with a `404 Not Found` if `user` is undefined:
+
+```javascript
+if (user) {
+  res.send(user);
+} else {
+  res.sendStatus(404);
+}
+```
+
+#### Code Implementation
+
+**Route Handler (`src/routes/users.js`):**
+```javascript
+router.put('/users/:id', async (req, res) => {
+  const { id } = req.params;
+  const { username, bio } = req.body;
+
+  const user = await UserRepo.update(id, username, bio);
+
+  if (user) {
+    res.send(user);
+  } else {
+    res.sendStatus(404);
+  }
+});
+```
+
+**Repository Method (`src/repos/user-repo.js`):**
+```javascript
+static async update(id, username, bio) {
+  const { rows } = await pool.query(
+    'UPDATE users SET username = $1, bio = $2 WHERE id = $3 RETURNING *;',
+    [username, bio, id]
+  );
+
+  return toCamelCase(rows)[0];
+}
+```
+
+#### Testing the Update Endpoint
+
+```http
+### Update user with ID 1
+PUT http://localhost:3005/users/1 HTTP/1.1
+Content-Type: application/json
+
+{
+  "username": "Alison156",
+  "bio": "I am Alison"
+}
+```
+
+**Expected API Response Sample:**
+```text
+HTTP/1.1 200 OK
+Content-Type: application/json; charset=utf-8
+
+{
+  "id": 1,
+  "createdAt": "2026-11-22T10:00:00.000Z",
+  "updatedAt": "2026-11-22T10:06:00.000Z",
+  "bio": "I am Alison",
+  "username": "Alison156"
+}
+```
+
+### Implementing User Deletion (`DELETE /users/:id`)
+
+Deleting a user requires parsing the target `id` from `req.params`, issuing a `DELETE` command, and confirming the deletion back to the client.
+
+#### The Crucial Role of `RETURNING *` on `DELETE`
+
+Just like `INSERT` and `UPDATE`, a standard `DELETE FROM users WHERE id = $1;` does not return row data from PostgreSQL.
+
+If `RETURNING *` is omitted:
+1. PostgreSQL deletes the row, but returns an empty `rows` array (`[]`).
+2. `UserRepo.delete(id)` returns `undefined`.
+3. The route handler assumes the user was not found and responds with `404 Not Found`—even though the record was actually deleted!
+
+Adding `RETURNING *` ensures that PostgreSQL returns the deleted record, allowing the route handler to distinguish between a successful deletion and a record that never existed.
+
+```sql
+DELETE FROM users WHERE id = $1 RETURNING *;
+```
+
+#### Code Implementation
+
+**Route Handler (`src/routes/users.js`):**
+```javascript
+router.delete('/users/:id', async (req, res) => {
+  const { id } = req.params;
+  const user = await UserRepo.delete(id);
+
+  if (user) {
+    res.send(user);
+  } else {
+    res.sendStatus(404);
+  }
+});
+```
+
+**Repository Method (`src/repos/user-repo.js`):**
+```javascript
+static async delete(id) {
+  const { rows } = await pool.query(
+    'DELETE FROM users WHERE id = $1 RETURNING *;',
+    [id]
+  );
+
+  return toCamelCase(rows)[0];
+}
+```
+
+#### Testing the Delete Endpoint
+
+```http
+### Delete user with ID 2
+DELETE http://localhost:3005/users/2 HTTP/1.1
+```
+
+**Expected API Response Sample:**
+```text
+HTTP/1.1 200 OK
+Content-Type: application/json; charset=utf-8
+
+{
+  "id": 2,
+  "createdAt": "2026-11-22T10:00:00.000Z",
+  "updatedAt": "2026-11-22T10:00:00.000Z",
+  "bio": "A little bit about me.",
+  "username": "Gia67"
+}
+```
+
+A subsequent `GET http://localhost:3005/users` confirms that user 2 has been permanently removed.
+
+### Complete Architecture Summary: Full Repository & Router Code
+
+Here is the complete code for the centralized data access layer and its corresponding route handlers.
+
+#### Centralized User Repository (`src/repos/user-repo.js`)
+
+```javascript
+const pool = require('../pool');
+const toCamelCase = require('./utils/to-camel-case');
+
+class UserRepo {
+  static async find() {
+    const { rows } = await pool.query('SELECT * FROM users;');
+    return toCamelCase(rows);
+  }
+
+  static async findById(id) {
+    const { rows } = await pool.query(
+      'SELECT * FROM users WHERE id = $1;',
+      [id]
+    );
+    return toCamelCase(rows)[0];
+  }
+
+  static async insert(username, bio) {
+    const { rows } = await pool.query(
+      'INSERT INTO users (username, bio) VALUES ($1, $2) RETURNING *;',
+      [username, bio]
+    );
+    return toCamelCase(rows)[0];
+  }
+
+  static async update(id, username, bio) {
+    const { rows } = await pool.query(
+      'UPDATE users SET username = $1, bio = $2 WHERE id = $3 RETURNING *;',
+      [username, bio, id]
+    );
+    return toCamelCase(rows)[0];
+  }
+
+  static async delete(id) {
+    const { rows } = await pool.query(
+      'DELETE FROM users WHERE id = $1 RETURNING *;',
+      [id]
+    );
+    return toCamelCase(rows)[0];
+  }
+}
+
+module.exports = UserRepo;
+```
+
+#### User Express Router (`src/routes/users.js`)
+
+```javascript
+const express = require('express');
+const UserRepo = require('../repos/user-repo');
+
+const router = express.Router();
+
+router.get('/users', async (req, res) => {
+  const users = await UserRepo.find();
+  res.send(users);
+});
+
+router.get('/users/:id', async (req, res) => {
+  const { id } = req.params;
+  const user = await UserRepo.findById(id);
+
+  if (user) {
+    res.send(user);
+  } else {
+    res.sendStatus(404);
+  }
+});
+
+router.post('/users', async (req, res) => {
+  const { username, bio } = req.body;
+  const user = await UserRepo.insert(username, bio);
+  res.send(user);
+});
+
+router.put('/users/:id', async (req, res) => {
+  const { id } = req.params;
+  const { username, bio } = req.body;
+  const user = await UserRepo.update(id, username, bio);
+
+  if (user) {
+    res.send(user);
+  } else {
+    res.sendStatus(404);
+  }
+});
+
+router.delete('/users/:id', async (req, res) => {
+  const { id } = req.params;
+  const user = await UserRepo.delete(id);
+
+  if (user) {
+    res.send(user);
+  } else {
+    res.sendStatus(404);
+  }
+});
+
+module.exports = router;
+```
+
+#### CRUD Operations & SQL Syntax Quick Reference
+
+| Operation | HTTP Verb | Route Path | Repository Method | SQL Statement |
+| :--- | :--- | :--- | :--- | :--- |
+| **Read All** | `GET` | `/users` | `UserRepo.find()` | `SELECT * FROM users;` |
+| **Read by ID** | `GET` | `/users/:id` | `UserRepo.findById(id)` | `SELECT * FROM users WHERE id = $1;` |
+| **Create** | `POST` | `/users` | `UserRepo.insert(username, bio)` | `INSERT INTO users (username, bio) VALUES ($1, $2) RETURNING *;` |
+| **Update** | `PUT` | `/users/:id` | `UserRepo.update(id, username, bio)` | `UPDATE users SET username = $1, bio = $2 WHERE id = $3 RETURNING *;` |
+| **Delete** | `DELETE` | `/users/:id` | `UserRepo.delete(id)` | `DELETE FROM users WHERE id = $1 RETURNING *;` |
+
+### Interactive Knowledge Check Quiz
+
+<details>
+<summary><b>Question 1: What is a SQL injection exploit, and how does string interpolation introduce it?</b></summary>
+<br>
+<b>Answer:</b> A SQL injection exploit occurs when untrusted user input is directly concatenated or interpolated into a raw SQL query. This allows an attacker to supply special SQL characters (such as semicolons or quotes) to inject additional SQL commands (like <code>DROP TABLE</code>) that the database engine compiles and executes.
+</details>
+
+<details>
+<summary><b>Question 2: How do prepared statements protect against SQL injection?</b></summary>
+<br>
+<b>Answer:</b> Prepared statements separate query structure from query data. The database first parses and compiles the SQL statement containing placeholders (e.g., <code>$1</code>). When parameter values are bound during execution, PostgreSQL strictly treats them as literal data values, never compiling or interpreting them as executable SQL code.
+</details>
+
+<details>
+<summary><b>Question 3: Can prepared statements be used to dynamically substitute table or column names?</b></summary>
+<br>
+<b>Answer:</b> No. Prepared statements only accept literal values (such as strings, numbers, or booleans). SQL identifiers (table names and column names) dictate query structure and cannot be parameterized using <code>$1</code> placeholders.
+</details>
+
+<details>
+<summary><b>Question 4: Why is the <code>RETURNING *</code> clause required on <code>INSERT</code>, <code>UPDATE</code>, and <code>DELETE</code> statements in PostgreSQL?</b></summary>
+<br>
+<b>Answer:</b> By default, PostgreSQL mutation queries only return a command status tag and row count, not the record data. Appending <code>RETURNING *</code> instructs PostgreSQL to return the modified or deleted rows, allowing the application to normalize column names and return the resulting object to the client.
+</details>
+
+<details>
+<summary><b>Question 5: What happens if <code>RETURNING *</code> is omitted from a repository's <code>delete(id)</code> method?</b></summary>
+<br>
+<b>Answer:</b> Without <code>RETURNING *</code>, <code>pool.query()</code> returns an empty <code>rows</code> array (<code>[]</code>). The repository method returns <code>undefined</code>, causing the route handler's <code>if (user)</code> check to fail and respond with an erroneous <code>404 Not Found</code> even though the row was deleted from the database.
 </details>
