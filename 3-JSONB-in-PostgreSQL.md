@@ -525,7 +525,7 @@ The `to_json()` and `to_jsonb()` functions convert any SQL value, date, or recor
 
 ```sql
 SELECT
-  to_jsonb(TRUE) AS bool_val,
+  to_jsonb(true) AS bool_val,
   to_jsonb('2026-06-19'::DATE) AS date_val;
 ```
 
