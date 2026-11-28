@@ -57,6 +57,11 @@ However, PostgreSQL provides several specialized index types. Choosing the wrong
          - [The Real-World Analogy](#the-real-world-analogy-7)
    * [When NOT to Add an Index (Anti-Patterns and Traps)](#when-not-to-add-an-index-anti-patterns-and-traps)
       + [Avoid Adding an Index in These Scenarios:](#avoid-adding-an-index-in-these-scenarios)
+         - [1. Small Tables (< a few thousand rows)](#1-small-tables--a-few-thousand-rows)
+         - [2. Low-Cardinality Columns (e.g., Boolean `is_active`, `gender`)](#2-low-cardinality-columns-eg-boolean-is_active-gender)
+         - [3. Write-Heavy / Ingestion Tables with Rare Reads](#3-write-heavy--ingestion-tables-with-rare-reads)
+         - [4. Columns Never Used in Filtering, Joining, or Sorting](#4-columns-never-used-in-filtering-joining-or-sorting)
+         - [5. Redundant Duplicate Indexes](#5-redundant-duplicate-indexes)
    * [Decision Flowchart: Which Index Should You Choose?](#decision-flowchart-which-index-should-you-choose)
    * [Master Index Comparison Table](#master-index-comparison-table)
 
@@ -880,16 +885,193 @@ Indexes are not free. Every index adds overhead that must be balanced against qu
 
 ### Avoid Adding an Index in These Scenarios:
 
-1. **Small Tables (< a few thousand rows):**
-   - If a table has only 500 rows, a sequential scan reads 3 or 4 disk pages consecutively. Traversing an index requires reading root, branch, leaf, and heap pages. Sequential scans are actually **faster** than index scans on small tables.
-2. **Low-Cardinality Columns (e.g., Boolean `is_active`, `gender`):**
-   - If a column has only 2 distinct values (50% `true`, 50% `false`), reading half the table via an index creates random disk I/O, which is slower than a linear sequential sweep. (Exception: Use a **Partial Index** if 99% are `true` and you only query the 1% `false`).
-3. **Write-Heavy / Ingestion Tables with Rare Reads:**
-   - Tables logging clickstreams, raw metrics, or ingest buffers where records are inserted at 10,000 rows/sec but queries only run once a night in a bulk batch.
-4. **Columns Never Used in Filtering, Joining, or Sorting:**
-   - Avoid indexing columns that only appear in the `SELECT` list (unless building a specific covering index with the `INCLUDE` clause).
-5. **Redundant Duplicate Indexes:**
-   - If you already have a composite index on `(tenant_id, created_at)`, creating a standalone index on `(tenant_id)` is 100% redundant and wastes RAM and write I/O.
+#### 1. Small Tables (< a few thousand rows)
+
+If a table has only a few hundred rows, it fits into just 3 or 4 contiguous 8 KB disk pages. Traversing an index requires reading root, branch, leaf, and heap pages—more total I/O than just reading the table sequentially. PostgreSQL's planner will **ignore the index** and choose a `Seq Scan` anyway, meaning the index only wastes disk space and slows down writes.
+
+```sql
+CREATE TABLE app_countries (
+    code CHAR(2) PRIMARY KEY,
+    name TEXT NOT NULL
+); -- 195 rows (~2 disk pages)
+
+CREATE INDEX idx_countries_name ON app_countries (name);
+
+EXPLAIN ANALYZE
+SELECT * FROM app_countries WHERE name = 'Japan';
+```
+
+**Output:**
+
+```text
+Seq Scan on app_countries  (cost=0.00..3.44 rows=1 width=18) (actual time=0.015..0.024 rows=1 loops=1)
+  Filter: (name = 'Japan'::text)
+  Rows Removed by Filter: 194
+Planning Time: 0.085 ms
+Execution Time: 0.036 ms
+-- Notice: idx_countries_name was completely IGNORED!
+```
+
+```text
++--------------------------------------------------------------------------+
+|               SMALL TABLE: SEQ SCAN BEATS INDEX SCAN                     |
++--------------------------------------------------------------------------+
+|  Sequential Scan (2 contiguous reads):                                   |
+|  [ Heap Page 1 ] ──> [ Heap Page 2 ] ──> Done! (0.02 ms)                 |
+|                                                                          |
+|  Index Scan (3+ scattered reads, if forced):                             |
+|  [ Index Root ] ──> [ Index Leaf ] ──> [ Heap Page 2 ] (More I/O!)       |
++--------------------------------------------------------------------------+
+```
+
+#### 2. Low-Cardinality Columns (e.g., Boolean `is_active`, `gender`)
+
+If a column has only 2 distinct values (50% `true`, 50% `false`), an index lookup would still need to fetch half the rows in the table via random heap jumps. PostgreSQL's planner knows that reading 50% of a table via random I/O is far slower than a single linear `Seq Scan`, so it ignores the index. _(Exception: Use a **Partial Index** if 99% of rows are `true` and you only query the 1% `false`.)_
+
+```sql
+CREATE INDEX idx_users_is_active ON users (is_active); -- 50% true, 50% false
+
+EXPLAIN ANALYZE
+SELECT id, username FROM users WHERE is_active = true;
+```
+
+**Output:**
+
+```text
+Seq Scan on users  (cost=0.00..1850.00 rows=50000 width=24) (actual time=0.018..14.200 rows=50000 loops=1)
+  Filter: is_active
+  Rows Removed by Filter: 50000
+Execution Time: 16.850 ms
+-- Planner rejects idx_users_is_active because selectivity is too low (50%)!
+```
+
+```text
++--------------------------------------------------------------------------+
+|            LOW CARDINALITY: RANDOM I/O vs. SEQUENTIAL SWEEP              |
++--------------------------------------------------------------------------+
+|  Index Scan (50% match):                                                 |
+|  [ Leaf ] ─┬─> Heap Page 1 (Row 2)                                       |
+|            ├─> Heap Page 1 (Row 5)  <-- Visits almost EVERY heap page    |
+|            ├─> Heap Page 2 (Row 1)      multiple times via random jumps! |
+|            └─> Heap Page 3 (Row 4)                                       |
+|                                                                          |
+|  Seq Scan (chosen by planner):                                           |
+|  [ Page 1 ] ──> [ Page 2 ] ──> [ Page 3 ]  (1 clean linear pass)         |
++--------------------------------------------------------------------------+
+```
+
+#### 3. Write-Heavy / Ingestion Tables with Rare Reads
+
+Tables logging clickstreams, telemetry, or ingestion buffers often receive thousands of `INSERT`s per second while being queried only once a night in a bulk batch. Every extra index forces PostgreSQL to update and WAL-log multiple B-Trees on every single row inserted, turning fast append-only writes into a bottleneck.
+
+```sql
+CREATE TABLE clickstream_events (
+    id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    user_id BIGINT,
+    page_url TEXT,
+    referrer TEXT,
+    created_at TIMESTAMPTZ DEFAULT now()
+);
+
+-- Anti-pattern: Adding 4 speculative indexes on an ingest-heavy table
+CREATE INDEX idx_click_user ON clickstream_events (user_id);
+CREATE INDEX idx_click_url  ON clickstream_events (page_url);
+CREATE INDEX idx_click_ref  ON clickstream_events (referrer);
+CREATE INDEX idx_click_time ON clickstream_events (created_at);
+
+-- Bulk insert 100,000 rows:
+-- With 0 extra indexes: ~180 ms
+-- With 4 extra B-Tree indexes: ~920 ms (5x slower writes + 4x WAL volume!)
+```
+
+```text
++--------------------------------------------------------------------------+
+|               WRITE AMPLIFICATION ON INGEST-HEAVY TABLES                 |
++--------------------------------------------------------------------------+
+|  INSERT 1 Row into `clickstream_events`                                  |
+|         │                                                                |
+|         ├──> Write to Table Heap (1x)                                    |
+|         ├──> Update PK B-Tree (1x)                                       |
+|         ├──> Update idx_click_user (2x)  ─┐                              |
+|         ├──> Update idx_click_url  (3x)   │  4x extra page splits,       |
+|         ├──> Update idx_click_ref  (4x)   │  WAL writes & lock contention|
+|         └──> Update idx_click_time (5x)  ─┘                              |
++--------------------------------------------------------------------------+
+```
+
+#### 4. Columns Never Used in Filtering, Joining, or Sorting
+
+Indexes are only used to locate, join, or sort rows (`WHERE`, `JOIN ON`, `ORDER BY`, `GROUP BY`). Indexing a column that only ever appears in the `SELECT` list gives zero query speedup—PostgreSQL already has to visit the table heap for the matching row anyway (unless you intentionally build a covering index with `INCLUDE`).
+
+```sql
+CREATE INDEX idx_users_bio ON users (bio); -- `bio` is never in WHERE/ORDER BY
+
+-- Query filters on `username`, only reads `bio` in SELECT:
+EXPLAIN ANALYZE
+SELECT username, bio FROM users WHERE username = 'user_4200';
+```
+
+**Output:**
+
+```text
+Index Scan using idx_users_username on users  (cost=0.29..8.30 rows=1 width=120) (actual time=0.031..0.032 rows=1 loops=1)
+  Index Cond: ((username)::text = 'user_4200'::text)
+-- `idx_users_bio` is NEVER touched; `bio` is fetched from the Heap Page!
+```
+
+```text
++--------------------------------------------------------------------------+
+|            UNUSED INDEX ON SELECT-ONLY COLUMN (`bio`)                    |
++--------------------------------------------------------------------------+
+|  Query: SELECT username, bio FROM users WHERE username = 'user_4200';    |
+|                                                                          |
+|  [ idx_users_username ] ──> Finds TID (Page 42, Slot 7)                  |
+|                                  │                                       |
+|                                  v                                       |
+|                           [ Heap Page 42 ] ──> Reads `bio` directly!     |
+|                                                                          |
+|  [ idx_users_bio ] ──> Sits idle on disk (0 scans, 100% write overhead)  |
++--------------------------------------------------------------------------+
+```
+
+#### 5. Redundant Duplicate Indexes
+
+Because a composite B-Tree index `(tenant_id, created_at)` is sorted first by `tenant_id`, it can already serve every query that filters solely on `tenant_id`. Creating a separate standalone index on `(tenant_id)` is 100% redundant—it doubles RAM consumption in `shared_buffers` and doubles write I/O for zero benefit.
+
+```sql
+-- Existing composite index:
+CREATE INDEX idx_orders_tenant_created ON orders (tenant_id, created_at);
+
+-- Redundant index (REMOVE THIS!):
+CREATE INDEX idx_orders_tenant_only ON orders (tenant_id);
+
+-- Check unused/redundant index scans in PostgreSQL:
+SELECT indexrelname, idx_scan, pg_size_pretty(pg_relation_size(indexrelid)) AS size
+FROM pg_stat_user_indexes
+WHERE relname = 'orders';
+```
+
+**Output:**
+
+```text
+       indexrelname        | idx_scan |  size
+---------------------------+----------+--------
+ idx_orders_tenant_created |   142890 | 42 MB
+ idx_orders_tenant_only    |        0 | 21 MB  <-- Pure waste!
+```
+
+```text
++--------------------------------------------------------------------------+
+|                 REDUNDANT PREFIX INDEX WASTE                             |
++--------------------------------------------------------------------------+
+|  idx_orders_tenant_created:  (tenant_id, created_at)  [42 MB]            |
+|  ├── Serves: WHERE tenant_id = 10 AND created_at > ...  ✅               |
+|  └── Serves: WHERE tenant_id = 10                       ✅               |
+|                                                                          |
+|  idx_orders_tenant_only:     (tenant_id)              [21 MB]            |
+|  └── Serves: WHERE tenant_id = 10  (Already covered above!) ❌ WASTED RAM|
++--------------------------------------------------------------------------+
+```
 
 ## Decision Flowchart: Which Index Should You Choose?
 
