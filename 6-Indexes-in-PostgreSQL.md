@@ -26,6 +26,10 @@ However, PostgreSQL provides several specialized index types. Choosing the wrong
       + [Supported Operators](#supported-operators-2)
       + [Practical Code Example](#practical-code-example-2)
          - [Nearest Neighbor Search (k-NN)](#nearest-neighbor-search-k-nn)
+         - [2D Map Viewport / Bounding Box Search (`<@`)](#2d-map-viewport--bounding-box-search-)
+         - [Date & Time Range Overlap (`&&` and `@>`)](#date--time-range-overlap--and-)
+         - [IP Subnet / CIDR Containment (`<<=`)](#ip-subnet--cidr-containment-)
+         - [Fuzzy Substring & Similarity Search (`pg_trgm`)](#fuzzy-substring--similarity-search-pg_trgm)
          - [Preventing Double Bookings (Exclusion Constraint)](#preventing-double-bookings-exclusion-constraint)
       + [When to Choose GiST](#when-to-choose-gist)
    * [GIN Indexes (Generalized Inverted Index)](#gin-indexes-generalized-inverted-index)
@@ -317,6 +321,195 @@ Limit  (cost=0.15..0.28 rows=2 width=44) (actual time=0.035..0.038 rows=2 loops=
         Order By: (coordinates <-> '(40.71,-74)'::point)
 Planning Time: 0.089 ms
 Execution Time: 0.052 ms
+```
+
+#### 2D Map Viewport / Bounding Box Search (`<@`)
+
+When a user pans or zooms a map UI, the application sends a rectangular viewport (`BOX`) or radius (`CIRCLE`) to find every location inside it. The `<@` ("contained by") operator uses `idx_restaurants_geo` directly—unlike `ST_X(p) BETWEEN ...` or separate `x`/`y` range filters, which cannot use a single 2D spatial index effectively.
+
+```sql
+-- Find all restaurants inside a rectangular map viewport:
+EXPLAIN ANALYZE
+SELECT name, coordinates
+FROM restaurant_locations
+WHERE coordinates <@ BOX(POINT(40.7000, -74.0200), POINT(40.7500, -73.9800));
+```
+
+**Output:**
+
+```text
+Index Scan using idx_restaurants_geo on restaurant_locations  (cost=0.14..8.16 rows=1 width=48) (actual time=0.024..0.025 rows=1 loops=1)
+  Index Cond: (coordinates <@ '(40.75,-73.98),(40.7,-74.02)'::box)
+Planning Time: 0.095 ms
+Execution Time: 0.041 ms
+```
+
+```text
++--------------------------------------------------------------------------+
+|               GiST 2D BOUNDING BOX CONTAINMENT (<@)                      |
++--------------------------------------------------------------------------+
+|   Lat (X)                                                                |
+|   40.80 ┤                       [ Uptown Bistro ]  (Outside -> Pruned)   |
+|         │                                                                |
+|   40.75 ┤    ┌──────────────────────┐  <-- Query Viewport (BOX)          |
+|         │    │  * Downtown Diner    │      (Overlaps Node A -> Descend)  |
+|   40.70 ┤    └──────────────────────┘                                    |
+|         │                                                                |
+|   40.67 ┤                                    [ Brooklyn Pizza ] (Pruned) |
+|         └────┴──────────┴───────────┴──────────┴──────────────────> Lon  |
+|            -74.02     -74.00      -73.98     -73.94                      |
+|                                                                          |
+|  How GiST hits the index:                                                |
+|  1. Each internal node stores a Minimum Bounding Rectangle (MBR).        |
+|  2. GiST checks if the node's MBR overlaps the query BOX.                |
+|  3. Non-overlapping subtrees (Uptown, Brooklyn) are skipped entirely.    |
++--------------------------------------------------------------------------+
+```
+
+#### Date & Time Range Overlap (`&&` and `@>`)
+
+B-Tree indexes struggle when querying whether two intervals overlap (`start_a < end_b AND end_a > start_b`), because B-Tree can only efficiently scan one boundary at a time. GiST indexes on `TSRANGE` or `DATERANGE` natively index the entire interval using `&&` (overlaps) and `@>` (contains).
+
+```sql
+-- Uses hotel_reservations (defined in the Exclusion Constraint section below):
+CREATE INDEX idx_reservations_period ON hotel_reservations USING gist (booking_period);
+
+-- Find all reservations overlapping a requested 3-day stay window:
+EXPLAIN ANALYZE
+SELECT room_number, booking_period
+FROM hotel_reservations
+WHERE booking_period && TSRANGE('2026-12-20 14:00', '2026-12-23 11:00');
+```
+
+**Output:**
+
+```text
+Bitmap Heap Scan on hotel_reservations  (cost=4.18..11.29 rows=4 width=36) (actual time=0.031..0.035 rows=2 loops=1)
+  Recheck Cond: (booking_period && '["2026-12-20 14:00:00","2026-12-23 11:00:00")'::tsrange)
+  Heap Blocks: exact=1
+  ->  Bitmap Index Scan on idx_reservations_period  (cost=0.00..4.18 rows=4 width=0) (actual time=0.022..0.022 rows=2 loops=1)
+        Index Cond: (booking_period && '["2026-12-20 14:00:00","2026-12-23 11:00:00")'::tsrange)
+Planning Time: 0.104 ms
+Execution Time: 0.058 ms
+```
+
+```text
++--------------------------------------------------------------------------+
+|                 GiST 1D INTERVAL OVERLAP SEARCH (&&)                     |
++--------------------------------------------------------------------------+
+|  Query Window:               [ Dec 20 ======== Dec 23 )                  |
+|                                                                          |
+|  [ NODE A: Bounding Span (Dec 01 ── Dec 15) ]                            |
+|    ├── Row 1: [Dec 02 ── Dec 05)   ──> Node A ends Dec 15 < Dec 20       |
+|    └── Row 2: [Dec 10 ── Dec 15)   ──> ENTIRE SUBTREE SKIPPED!           |
+|                                                                          |
+|  [ NODE B: Bounding Span (Dec 18 ──────────────────── Dec 28) ]          |
+|    ├── Row 3: [Dec 18 ──── Dec 21) ──> Overlaps Query! (MATCH)           |
+|    ├── Row 4: [Dec 22 ──── Dec 25) ──> Overlaps Query! (MATCH)           |
+|    └── Row 5: [Dec 26 ── Dec 28)   ──> Leaf checked, no overlap.         |
+|                                                                          |
+|  Note: A query using `@>` (e.g., `booking_period @> '2026-12-22'::ts`)   |
+|  hits the exact same GiST index by treating the point as a zero-width    |
+|  interval and pruning any node whose bounding span excludes it.          |
++--------------------------------------------------------------------------+
+```
+
+#### IP Subnet / CIDR Containment (`<<=`)
+
+When storing IPv4/IPv6 addresses or CIDR blocks in an `INET` column, GiST with the `inet_ops` operator class indexes network hierarchies. This lets you find all logs belonging to a subnet (`<<=`) or find which subnet rule contains a specific IP (`>>=`) without converting IPs to integer ranges.
+
+```sql
+CREATE TABLE access_logs (
+    id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    client_ip INET NOT NULL,
+    requested_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Note: inet_ops is required explicitly for GiST on INET/CIDR columns:
+CREATE INDEX idx_logs_ip_gist ON access_logs USING gist (client_ip inet_ops);
+
+-- Find all requests originating from the 192.168.10.0/24 subnet:
+EXPLAIN ANALYZE
+SELECT id, client_ip
+FROM access_logs
+WHERE client_ip <<= '192.168.10.0/24'::inet;
+```
+
+**Output:**
+
+```text
+Bitmap Heap Scan on access_logs  (cost=4.22..14.60 rows=12 width=24) (actual time=0.028..0.036 rows=10 loops=1)
+  Recheck Cond: (client_ip <<= '192.168.10.0/24'::inet)
+  Heap Blocks: exact=2
+  ->  Bitmap Index Scan on idx_logs_ip_gist  (cost=0.00..4.21 rows=12 width=0) (actual time=0.019..0.019 rows=10 loops=1)
+        Index Cond: (client_ip <<= '192.168.10.0/24'::inet)
+Planning Time: 0.088 ms
+Execution Time: 0.052 ms
+```
+
+```text
++--------------------------------------------------------------------------+
+|                GiST IP / CIDR SUBNET CONTAINMENT (<<=)                   |
++--------------------------------------------------------------------------+
+|                         [ ROOT: 0.0.0.0/0 ]                              |
+|                          /                \                              |
+|         [ NODE A: 10.0.0.0/8 ]        [ NODE B: 192.168.0.0/16 ]         |
+|         (Does NOT overlap             (Contains 192.168.10.0/24          |
+|          192.168.10.0/24               ──> Descend into Node B)          |
+|          ──> Pruned!)                        │                           |
+|                                              v                           |
+|                                  [ LEAF: 192.168.10.0/24 ]               |
+|                                    ├── 192.168.10.5   (MATCH)            |
+|                                    └── 192.168.10.42  (MATCH)            |
+|                                                                          |
+|  Each GiST node stores the smallest common CIDR prefix (bounding subnet) |
+|  covering all child IPs, allowing instant pruning of unrelated networks. |
++--------------------------------------------------------------------------+
+```
+
+#### Fuzzy Substring & Similarity Search (`pg_trgm`)
+
+Standard B-Tree indexes fail on leading-wildcard queries (`ILIKE '%pizza%'`) because the prefix is unknown. Using the `pg_trgm` extension with `gist_trgm_ops`, GiST decomposes strings into 3-character trigrams and compresses each node's trigrams into a **fixed-size bitmask signature** (RD-Tree). It supports `ILIKE '%...%'`, regex (`~`), and trigram similarity (`%` and `<->` ordering).
+
+```sql
+CREATE EXTENSION IF NOT EXISTS pg_trgm;
+
+-- Create a GiST trigram index on restaurant names:
+CREATE INDEX idx_restaurants_name_trgm ON restaurant_locations USING gist (name gist_trgm_ops);
+
+-- Leading-wildcard substring search (impossible for standard B-Tree):
+EXPLAIN ANALYZE
+SELECT name
+FROM restaurant_locations
+WHERE name ILIKE '%pizz%';
+```
+
+**Output:**
+
+```text
+Index Scan using idx_restaurants_name_trgm on restaurant_locations  (cost=0.14..8.16 rows=1 width=32) (actual time=0.042..0.043 rows=1 loops=1)
+  Index Cond: (name ~~* '%pizz%'::text)
+Planning Time: 0.145 ms
+Execution Time: 0.061 ms
+```
+
+```text
++--------------------------------------------------------------------------+
+|              GiST TRIGRAM SIGNATURE TREE (gist_trgm_ops)                 |
++--------------------------------------------------------------------------+
+|  Query: ILIKE '%pizz%'  ──> Trigrams: { "piz", "izz" }                   |
+|  Query Bitmask Signature:   [ 0 1 0 0 1 0 1 0 ]  (bits for "piz", "izz") |
+|                                                                          |
+|  [ NODE A: Union Signature = 1 0 1 0 0 0 0 0 ]                           |
+|    ("Diner", "Bistro") -> Missing required query bits ──> PRUNED!        |
+|                                                                          |
+|  [ NODE B: Union Signature = 1 1 1 0 1 1 1 0 ]                           |
+|    Bitwise AND matches query signature ──> Descend to Leaf!              |
+|      └── Row: "Brooklyn Pizza" -> Recheck `ILIKE '%pizz%'` ──> MATCH!    |
+|                                                                          |
+|  Why GiST here? Unlike GIN (exact posting lists), GiST uses lossy bit    |
+|  signatures that are smaller and also support k-NN similarity (`<->`).   |
++--------------------------------------------------------------------------+
 ```
 
 #### Preventing Double Bookings (Exclusion Constraint)
